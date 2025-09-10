@@ -104,6 +104,55 @@ impl std::error::Error for RecvError {}
 /// A TCP socket ring buffer.
 pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
 
+/// Trait for synchronizing with NICs that can autonomously inject TCP segments
+pub trait InjectedSegmentSynchronizer {
+    /// Notify of upcoming send and retrieve any autonomously injected data
+    /// Returns any data the implementation sent since last call
+    fn sync_tx(&mut self, upcoming_send_len: usize) -> Option<Vec<u8>>;
+}
+
+/// A synchronizer that never injects any segments
+#[derive(Debug)]
+pub struct NoOpSynchronizer;
+
+impl InjectedSegmentSynchronizer for NoOpSynchronizer {
+    fn sync_tx(&mut self, _upcoming_send_len: usize) -> Option<Vec<u8>> {
+        None // Never injects anything
+    }
+}
+
+/// A synchronizer that never injects any segments
+#[derive(Debug)]
+pub struct WrongSynchronizer;
+
+impl InjectedSegmentSynchronizer for WrongSynchronizer {
+    fn sync_tx(&mut self, _upcoming_send_len: usize) -> Option<Vec<u8>> {
+        Some(b"e".to_vec())
+    }
+}
+
+/// Enum wrapper for different segment synchronizer implementations
+#[derive(Debug)]
+pub enum AnyInjectedSegmentSynchronizer {
+    NoOp(NoOpSynchronizer),
+    Wrong(WrongSynchronizer),
+}
+
+impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
+    fn sync_tx(&mut self, upcoming_send_len: usize) -> Option<Vec<u8>> {
+        match self {
+            Self::NoOp(sync) => sync.sync_tx(upcoming_send_len),
+            Self::Wrong(sync) => sync.sync_tx(upcoming_send_len),
+        }
+    }
+}
+
+impl Default for AnyInjectedSegmentSynchronizer {
+    fn default() -> Self {
+        Self::Wrong(WrongSynchronizer)
+    }
+}
+
 /// The state of a TCP socket, according to [RFC 793].
 ///
 /// [RFC 793]: https://tools.ietf.org/html/rfc793
@@ -547,6 +596,9 @@ pub struct Socket<'a> {
     /// If this is set, we will not send a SYN|ACK until this is unset.
     #[cfg(feature = "socket-tcp-pause-synack")]
     synack_paused: bool,
+
+    /// Synchronizer for handling externally injected TCP segments
+    segment_synchronizer: AnyInjectedSegmentSynchronizer,
 }
 
 const DEFAULT_MSS: usize = 536;
@@ -613,6 +665,8 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-pause-synack")]
             synack_paused: false,
+
+            segment_synchronizer: AnyInjectedSegmentSynchronizer::default(),
         }
     }
 
@@ -1224,9 +1278,10 @@ impl<'a> Socket<'a> {
         !self.rx_buffer.is_empty()
     }
 
-    fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
+    /// CH function potentially adds to buffer
+    fn send_impl<F, R>(&mut self, f: F) -> Result<R, SendError>
     where
-        F: FnOnce(&'b mut SocketBuffer<'a>) -> (usize, R),
+        F: FnOnce(&mut SocketBuffer<'a>) -> (usize, R),
     {
         if !self.may_send() {
             return Err(SendError::InvalidState);
@@ -1234,33 +1289,61 @@ impl<'a> Socket<'a> {
 
         let old_length = self.tx_buffer.len();
         let (size, result) = f(&mut self.tx_buffer);
+        
+        // Handle the size > 0 case after the closure's lifetime ends
         if size > 0 {
-            // The connection might have been idle for a long time, and so remote_last_ts
-            // would be far in the past. Unless we clear it here, we'll abort the connection
-            // down over in dispatch() by erroneously detecting it as timed out.
-            if old_length == 0 {
-                self.remote_last_ts = None
-            }
-
-            // if remote win is zero and we go from having no data to some data pending to
-            // send, start the zero window probe timer.
-            if self.remote_win_len == 0 && self.timer.is_idle() {
-                let delay = self.rtte.retransmission_timeout();
-                tcp_trace!("starting zero-window-probe timer for t+{}", delay);
-
-                // We don't have access to the current time here, so use Instant::ZERO instead.
-                // this will cause the first ZWP to be sent immediately, but that's okay.
-                self.timer.set_for_zero_window_probe(Instant::ZERO, delay);
-            }
-
-            #[cfg(any(test, feature = "verbose"))]
-            tcp_trace!(
-                "tx buffer: enqueueing {} octets (now {})",
-                size,
-                old_length + size
-            );
+            self.handle_new_data_sent(size, old_length)?;
         }
+        
         Ok(result)
+    }
+    
+    fn handle_new_data_sent(&mut self, size: usize, old_length: usize) -> Result<(), SendError> {
+        // Check for externally injected segments
+        if let Some(injected_data) = self.segment_synchronizer.sync_tx(size) {
+            tcp_trace!("external injector provided {} bytes", injected_data.len());
+            
+            // Add the externally-sent data to our tx_buffer
+            match self.enqueue_already_sent(&injected_data) {
+                Ok(injected_size) => {
+                    if injected_size != injected_data.len() {
+                        tcp_trace!("WARNING: Could not enqueue all injected data: {}/{} bytes", 
+                                  injected_size, injected_data.len());
+                    }
+                }
+                Err(e) => {
+                    tcp_trace!("ERROR: Failed to enqueue injected data: {:?}", e);
+                    return Err(e);
+                }
+            }
+        }
+        
+        // The connection might have been idle for a long time, and so remote_last_ts
+        // would be far in the past. Unless we clear it here, we'll abort the connection
+        // down over in dispatch() by erroneously detecting it as timed out.
+        if old_length == 0 {
+            self.remote_last_ts = None
+        }
+
+        // if remote win is zero and we go from having no data to some data pending to
+        // send, start the zero window probe timer.
+        if self.remote_win_len == 0 && self.timer.is_idle() {
+            let delay = self.rtte.retransmission_timeout();
+            tcp_trace!("starting zero-window-probe timer for t+{}", delay);
+
+            // We don't have access to the current time here, so use Instant::ZERO instead.
+            // this will cause the first ZWP to be sent immediately, but that's okay.
+            self.timer.set_for_zero_window_probe(Instant::ZERO, delay);
+        }
+
+        #[cfg(any(test, feature = "verbose"))]
+        tcp_trace!(
+            "tx buffer: enqueueing {} octets (now {})",
+            size,
+            old_length + size
+        );
+        
+        Ok(())
     }
 
     /// Call `f` with the largest contiguous slice of octets in the transmit buffer,
@@ -1268,9 +1351,10 @@ impl<'a> Socket<'a> {
     ///
     /// This function returns `Err(Error::Illegal)` if the transmit half of
     /// the connection is not open; see [may_send](#method.may_send).
-    pub fn send<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
+    /// CH function potentially adds to buffer
+    pub fn send<F, R>(&mut self, f: F) -> Result<R, SendError>
     where
-        F: FnOnce(&'b mut [u8]) -> (usize, R),
+        F: FnOnce(&mut [u8]) -> (usize, R),
     {
         self.send_impl(|tx_buffer| tx_buffer.enqueue_many_with(f))
     }
@@ -1281,11 +1365,39 @@ impl<'a> Socket<'a> {
     /// by the amount of free space in the transmit buffer; down to zero.
     ///
     /// See also [send](#method.send).
+    /// CH function potentially adds to buffer
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
         self.send_impl(|tx_buffer| {
             let size = tx_buffer.enqueue_slice(data);
             (size, size)
         })
+    }
+
+    /// Enqueue data that has already been sent by external means (e.g., NIC)
+    /// This updates tx_buffer for ACK tracking but doesn't trigger transmission
+    /// since the data has already been sent.
+    ///
+    /// This function returns the amount of octets actually enqueued, which is limited
+    /// by the amount of free space in the transmit buffer; down to zero.
+    pub fn enqueue_already_sent(&mut self, data: &[u8]) -> Result<usize, SendError> {
+        if !self.may_send() {
+            return Err(SendError::InvalidState);
+        }
+
+        let size = self.tx_buffer.enqueue_slice(data);
+        if size > 0 {
+            // Key difference: immediately advance remote_last_seq
+            self.remote_last_seq = self.remote_last_seq + size;
+            
+            #[cfg(any(test, feature = "verbose"))]
+            tcp_trace!(
+                "tx buffer: enqueueing {} octets already sent externally (remote_last_seq now {})",
+                size,
+                self.remote_last_seq
+            );
+        }
+        
+        Ok(size)
     }
 
     fn recv_error_check(&mut self) -> Result<(), RecvError> {
