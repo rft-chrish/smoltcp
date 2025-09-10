@@ -10,7 +10,7 @@ use crate::wire::{IpAddress, IpProtocol};
 ///
 /// A sequence number is a monotonically advancing integer modulo 2<sup>32</sup>.
 /// Sequence numbers do not have a discontiguity when compared pairwise across a signed overflow.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default, Ord)]
 pub struct SeqNumber(pub i32);
 
 impl SeqNumber {

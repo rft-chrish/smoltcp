@@ -10,12 +10,27 @@ use core::{fmt, mem};
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt};
-use crate::storage::{Assembler, RingBuffer};
+use crate::storage::{Assembler, MaskedSocketBuffer, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber,
     TcpTimestampGenerator, TcpTimestampRepr, TCP_HEADER_LEN,
 };
+/// Error type for DMA operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmaError {
+    Illegal,
+    AlreadyEnabled,
+}
+
+impl fmt::Display for DmaError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            DmaError::Illegal => write!(f, "illegal DMA operation"),
+            DmaError::AlreadyEnabled => write!(f, "DMA is already enabled"),
+        }
+    }
+}
 
 mod congestion;
 
@@ -103,6 +118,217 @@ impl std::error::Error for RecvError {}
 
 /// A TCP socket ring buffer.
 pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
+
+/// A TCP socket ring buffer with masking capability for handling NIC-injected segments.
+pub type MaskedTxBuffer<'a> = MaskedSocketBuffer<'a>;
+
+/// Trait for synchronizing with NICs that can autonomously inject TCP segments
+pub trait InjectedSegmentSynchronizer {
+    /// Send payload via DMA and retrieve any autonomously injected data
+    /// Returns any data the FPGA sent since last call
+    /// Returns an error if DMA is disabled
+    fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError>;
+
+    /// Enable DMA and notify FPGA it can send autonomous packets
+    /// Takes sequence_number and ack_number to sync FPGA with current TCP state
+    fn enable_dma(
+        &mut self,
+        seq_num: TcpSeqNumber,
+        ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError>;
+
+    /// Disable DMA and retrieve any pending FPGA-sent data
+    fn disable_dma(&mut self) -> Result<Vec<u8>, DmaError>;
+
+    /// Check for new autonomous data without disabling DMA
+    /// Returns any data the FPGA sent since last call, or None if no new data
+    fn get_new_autonomous_data(&mut self) -> Result<Option<Vec<u8>>, DmaError>;
+}
+
+/// A synchronizer that has no FPGA connection
+#[derive(Debug)]
+pub struct NoFpgaSynchronizer;
+
+impl InjectedSegmentSynchronizer for NoFpgaSynchronizer {
+    fn send_data_via_dma(&mut self, _payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
+        Err(DmaError::Illegal) // No FPGA to send to
+    }
+
+    fn enable_dma(
+        &mut self,
+        _seq_num: TcpSeqNumber,
+        _ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError> {
+        Err(DmaError::Illegal) // Cannot enable DMA without FPGA
+    }
+
+    fn disable_dma(&mut self) -> Result<Vec<u8>, DmaError> {
+        Ok(Vec::new()) // Always succeeds, returns no data
+    }
+
+    fn get_new_autonomous_data(&mut self) -> Result<Option<Vec<u8>>, DmaError> {
+        Err(DmaError::Illegal) // No FPGA to get data from
+    }
+}
+
+/// A length-based mock synchronizer for proof-of-concept
+#[derive(Debug)]
+pub struct LengthMockSynchronizer {
+    /// Simulated FPGA buffer of autonomously sent data (as lengths)
+    fpga_sent_lengths: Vec<usize>,
+    dma_enabled: bool,
+}
+
+impl LengthMockSynchronizer {
+    pub fn new() -> Self {
+        Self {
+            fpga_sent_lengths: Vec::new(),
+            dma_enabled: false,
+        }
+    }
+
+    /// Simulate FPGA sending data autonomously
+    pub fn simulate_fpga_send(&mut self, length: usize) {
+        if self.dma_enabled {
+            self.fpga_sent_lengths.push(length);
+        }
+    }
+}
+
+impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
+    fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
+        if !self.dma_enabled {
+            return Err(DmaError::Illegal);
+        }
+
+        // For proof-of-concept: just send the length to FPGA
+        let payload_len = payload.len();
+        tcp_trace!("Sending {} bytes to FPGA (mock)", payload_len);
+
+        // Check if FPGA has sent anything autonomously
+        if !self.fpga_sent_lengths.is_empty() {
+            let total_fpga_len: usize = self.fpga_sent_lengths.drain(..).sum();
+            if total_fpga_len > 0 {
+                // Return mock data ('*' repeated for the total length)
+                let mock_data = vec![b'*'; total_fpga_len];
+                tcp_trace!("FPGA autonomously sent {} bytes (mock)", total_fpga_len);
+                return Ok(Some(mock_data));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn enable_dma(
+        &mut self,
+        seq_num: TcpSeqNumber,
+        ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError> {
+        self.dma_enabled = true;
+        tcp_trace!(
+            "DMA enabled for LengthMockSynchronizer with seq={}, ack={}",
+            seq_num,
+            ack_num
+        );
+        Ok(())
+    }
+
+    fn disable_dma(&mut self) -> Result<Vec<u8>, DmaError> {
+        self.dma_enabled = false;
+        tcp_trace!("DMA disabled for LengthMockSynchronizer");
+
+        // Return any pending FPGA data
+        if !self.fpga_sent_lengths.is_empty() {
+            let total_fpga_len: usize = self.fpga_sent_lengths.drain(..).sum();
+            if total_fpga_len > 0 {
+                let mock_data = vec![b'*'; total_fpga_len];
+                tcp_trace!("Returning {} bytes of pending FPGA data", total_fpga_len);
+                return Ok(mock_data);
+            }
+        }
+
+        Ok(Vec::new())
+    }
+
+    fn get_new_autonomous_data(&mut self) -> Result<Option<Vec<u8>>, DmaError> {
+        if !self.dma_enabled {
+            return Err(DmaError::Illegal);
+        }
+
+        // Check if FPGA has sent anything autonomously
+        if !self.fpga_sent_lengths.is_empty() {
+            let total_fpga_len: usize = self.fpga_sent_lengths.drain(..).sum();
+            if total_fpga_len > 0 {
+                // Return mock data ('*' repeated for the total length)
+                let mock_data = vec![b'*'; total_fpga_len];
+                tcp_trace!(
+                    "FPGA autonomously sent {} bytes (mock) via get_new_autonomous_data",
+                    total_fpga_len
+                );
+                return Ok(Some(mock_data));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+/// Enum wrapper for different segment synchronizer implementations
+#[derive(Debug)]
+pub enum AnyInjectedSegmentSynchronizer {
+    NoFpga(NoFpgaSynchronizer),
+    LengthMock(LengthMockSynchronizer),
+    #[cfg(test)]
+    Test(test::TestFpgaSynchronizer),
+}
+
+impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
+    fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
+        match self {
+            Self::NoFpga(sync) => sync.send_data_via_dma(payload),
+            Self::LengthMock(sync) => sync.send_data_via_dma(payload),
+            #[cfg(test)]
+            Self::Test(sync) => sync.send_data_via_dma(payload),
+        }
+    }
+
+    fn enable_dma(
+        &mut self,
+        seq_num: TcpSeqNumber,
+        ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError> {
+        match self {
+            Self::NoFpga(sync) => sync.enable_dma(seq_num, ack_num),
+            Self::LengthMock(sync) => sync.enable_dma(seq_num, ack_num),
+            #[cfg(test)]
+            Self::Test(sync) => sync.enable_dma(seq_num, ack_num),
+        }
+    }
+
+    fn disable_dma(&mut self) -> Result<Vec<u8>, DmaError> {
+        match self {
+            Self::NoFpga(sync) => sync.disable_dma(),
+            Self::LengthMock(sync) => sync.disable_dma(),
+            #[cfg(test)]
+            Self::Test(sync) => sync.disable_dma(),
+        }
+    }
+
+    fn get_new_autonomous_data(&mut self) -> Result<Option<Vec<u8>>, DmaError> {
+        match self {
+            Self::NoFpga(sync) => sync.get_new_autonomous_data(),
+            Self::LengthMock(sync) => sync.get_new_autonomous_data(),
+            #[cfg(test)]
+            Self::Test(sync) => sync.get_new_autonomous_data(),
+        }
+    }
+}
+
+impl Default for AnyInjectedSegmentSynchronizer {
+    fn default() -> Self {
+        Self::NoFpga(NoFpgaSynchronizer)
+    }
+}
 
 /// The state of a TCP socket, according to [RFC 793].
 ///
@@ -470,7 +696,7 @@ pub struct Socket<'a> {
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
-    tx_buffer: SocketBuffer<'a>,
+    tx_buffer: MaskedTxBuffer<'a>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
     /// Interval at which keep-alive packets will be sent.
@@ -547,9 +773,22 @@ pub struct Socket<'a> {
     /// If this is set, we will not send a SYN|ACK until this is unset.
     #[cfg(feature = "socket-tcp-pause-synack")]
     synack_paused: bool,
+
+    /// Synchronizer for handling externally injected TCP segments
+    segment_synchronizer: AnyInjectedSegmentSynchronizer,
+
+    /// Whether DMA sending is currently enabled
+    dma_enabled: bool,
+
+    /// Track if DMA was enabled before retransmission so it can be restored afterward
+    dma_was_enabled_before_retransmit: bool,
+
+    /// Last time FPGA was polled for autonomous packets
+    last_fpga_poll: Option<Instant>,
 }
 
 const DEFAULT_MSS: usize = 536;
+const FPGA_POLL_INTERVAL: Duration = Duration::from_millis(50); // Poll every 50ms
 
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
@@ -558,7 +797,8 @@ impl<'a> Socket<'a> {
     where
         T: Into<SocketBuffer<'a>>,
     {
-        let (rx_buffer, tx_buffer) = (rx_buffer.into(), tx_buffer.into());
+        let rx_buffer = rx_buffer.into();
+        let tx_buffer = MaskedTxBuffer::from(tx_buffer.into());
         let rx_capacity = rx_buffer.capacity();
 
         // From RFC 1323:
@@ -613,6 +853,153 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-pause-synack")]
             synack_paused: false,
+
+            segment_synchronizer: AnyInjectedSegmentSynchronizer::default(),
+            dma_enabled: false,
+            dma_was_enabled_before_retransmit: false,
+            last_fpga_poll: None,
+        }
+    }
+
+    pub fn set_synchronizer(&mut self, synchronizer: AnyInjectedSegmentSynchronizer) {
+        self.segment_synchronizer = synchronizer;
+    }
+
+    /// Enable DMA sending and notify FPGA it can send autonomous packets
+    /// Takes current sequence and ack numbers to sync FPGA with TCP state
+    pub fn enable_dma(&mut self) -> Result<(), DmaError> {
+        if self.dma_enabled {
+            return Err(DmaError::AlreadyEnabled);
+        }
+        tcp_trace!(
+            "Enabling DMA: buffer_len={}, remote_last_seq={}, remote_seq_no={}",
+            self.tx_buffer.len(),
+            self.remote_last_seq,
+            self.remote_seq_no
+        );
+        self.segment_synchronizer
+            .enable_dma(self.remote_last_seq, self.remote_seq_no)?;
+        self.dma_enabled = true;
+        Ok(())
+    }
+
+    /// Disable DMA sending and retrieve any pending FPGA-sent data
+    /// Returns any data the FPGA has autonomously sent since last call
+    pub fn disable_dma(&mut self) -> Result<Vec<u8>, DmaError> {
+        if !self.dma_enabled {
+            return Err(DmaError::Illegal);
+        }
+        tcp_trace!(
+            "Disabling DMA: buffer_len={}, remote_last_seq={}, remote_seq_no={}",
+            self.tx_buffer.len(),
+            self.remote_last_seq,
+            self.remote_seq_no
+        );
+        let result = self.segment_synchronizer.disable_dma()?;
+        self.dma_enabled = false;
+        Ok(result)
+    }
+
+    /// Check if DMA sending is currently enabled
+    pub fn is_dma_enabled(&self) -> bool {
+        self.dma_enabled
+    }
+
+    /// Show a visual representation of the socket's buffer state for debugging
+    #[cfg(any(test, feature = "verbose"))]
+    pub fn show_socket_state(&self) {
+        println!("=== TCP Socket State ===");
+        println!("State: {:?}", self.state);
+        println!("Timer: {:?}", self.timer);
+        println!("local_seq_no: {} (start of tx buffer)", self.local_seq_no);
+        println!(
+            "remote_last_seq: {} (sent up to here)",
+            self.remote_last_seq
+        );
+        println!("Buffer length: {} bytes", self.tx_buffer.len());
+
+        if self.tx_buffer.len() == 0 {
+            println!("Buffer is empty");
+            return;
+        }
+
+        // Get all data from buffer
+        let all_data = self.tx_buffer.get_allocated(0, self.tx_buffer.len());
+
+        // Show buffer contents with sequence numbers
+        println!("\nBuffer contents (sequence number : byte [mask]):");
+        for (i, &byte) in all_data.iter().enumerate() {
+            let seq_num = TcpSeqNumber(self.local_seq_no.0 + i as i32);
+            let is_masked = !self.tx_buffer.is_range_fully_transmittable(i, 1);
+            let mask_char = if is_masked { 'X' } else { 'T' };
+            let sent_marker = if seq_num < self.remote_last_seq {
+                "<SENT"
+            } else {
+                ""
+            };
+
+            let char_repr = if byte.is_ascii_graphic() || byte == b' ' {
+                format!("'{}'", byte as char)
+            } else {
+                format!("{:02x}", byte)
+            };
+
+            println!(
+                "  {:>10} : {} [{}] {}",
+                seq_num, char_repr, mask_char, sent_marker
+            );
+        }
+
+        println!("\nLegend:");
+        println!("  [T] = Transmittable (mask=true)");
+        println!("  [X] = Masked/Already sent (mask=false)");
+        println!("  <SENT = Bytes already sent (seq < remote_last_seq)");
+
+        // Show what would be transmitted next
+        if self.remote_last_seq >= self.local_seq_no {
+            let offset = (self.remote_last_seq - self.local_seq_no) as usize;
+            if offset < self.tx_buffer.len() {
+                let remaining_size = self.tx_buffer.len() - offset;
+                let transmittable = self.tx_buffer.get_transmittable(offset, remaining_size);
+                println!(
+                    "\nNext transmittable data from offset {}: {:?}",
+                    offset,
+                    std::str::from_utf8(&transmittable).unwrap_or("<non-utf8>")
+                );
+            } else {
+                println!(
+                    "\nNo more data to transmit (offset {} >= buffer length {})",
+                    offset,
+                    self.tx_buffer.len()
+                );
+            }
+        }
+        println!("========================");
+    }
+
+    /// Check if it's time to poll FPGA for autonomous data
+    fn should_poll_fpga(&self, now: Instant) -> bool {
+        if !self.dma_enabled {
+            return false;
+        }
+
+        match self.last_fpga_poll {
+            None => true, // Never polled before
+            Some(last_poll) => now - last_poll >= FPGA_POLL_INTERVAL,
+        }
+    }
+
+    /// Poll FPGA for any new autonomous data
+    fn poll_fpga(&mut self, now: Instant) -> Option<Vec<u8>> {
+        self.last_fpga_poll = Some(now);
+
+        match self.segment_synchronizer.get_new_autonomous_data() {
+            Ok(Some(data)) => Some(data),
+            Ok(None) => None,
+            Err(e) => {
+                tcp_trace!("Error polling FPGA: {:?}", e);
+                None
+            }
         }
     }
 
@@ -1066,6 +1453,31 @@ impl<'a> Socket<'a> {
     /// connection; only the remote end can close it. If you no longer wish to receive any
     /// data and would like to reuse the socket right away, use [abort](#method.abort).
     pub fn close(&mut self) {
+        // Before closing, check for any pending FPGA packets if DMA is enabled
+        if self.dma_enabled {
+            match self.segment_synchronizer.get_new_autonomous_data() {
+                Ok(Some(fpga_data)) => {
+                    tcp_trace!(
+                        "Received {} bytes of autonomous FPGA data during shutdown",
+                        fpga_data.len()
+                    );
+                    // Add autonomous data to tx_buffer as already sent
+                    let fpga_size = self.tx_buffer.enqueue_already_sent(&fpga_data);
+                    if fpga_size != fpga_data.len() {
+                        tcp_trace!(
+                            "WARNING: Could not enqueue all autonomous FPGA data during shutdown: {}/{} bytes",
+                            fpga_size,
+                            fpga_data.len()
+                        );
+                    }
+                }
+                Ok(None) => {} // No FPGA data pending
+                Err(e) => {
+                    tcp_trace!("Error checking for FPGA data during shutdown: {:?}", e);
+                }
+            }
+        }
+
         match self.state {
             // In the LISTEN state there is no established connection.
             State::Listen => self.set_state(State::Closed),
@@ -1096,6 +1508,31 @@ impl<'a> Socket<'a> {
     /// In terms of the TCP state machine, the socket may be in any state and is moved to
     /// the `CLOSED` state.
     pub fn abort(&mut self) {
+        // Before aborting, check for any pending FPGA packets if DMA is enabled
+        if self.dma_enabled {
+            match self.segment_synchronizer.get_new_autonomous_data() {
+                Ok(Some(fpga_data)) => {
+                    tcp_trace!(
+                        "Received {} bytes of autonomous FPGA data during abort",
+                        fpga_data.len()
+                    );
+                    // Add autonomous data to tx_buffer as already sent
+                    let fpga_size = self.tx_buffer.enqueue_already_sent(&fpga_data);
+                    if fpga_size != fpga_data.len() {
+                        tcp_trace!(
+                            "WARNING: Could not enqueue all autonomous FPGA data during abort: {}/{} bytes",
+                            fpga_size,
+                            fpga_data.len()
+                        );
+                    }
+                }
+                Ok(None) => {} // No FPGA data pending
+                Err(e) => {
+                    tcp_trace!("Error checking for FPGA data during abort: {:?}", e);
+                }
+            }
+        }
+
         self.set_state(State::Closed);
     }
 
@@ -1224,9 +1661,9 @@ impl<'a> Socket<'a> {
         !self.rx_buffer.is_empty()
     }
 
-    fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
+    fn send_impl<F, R>(&mut self, f: F) -> Result<R, SendError>
     where
-        F: FnOnce(&'b mut SocketBuffer<'a>) -> (usize, R),
+        F: FnOnce(&mut MaskedTxBuffer<'a>) -> (usize, R),
     {
         if !self.may_send() {
             return Err(SendError::InvalidState);
@@ -1234,33 +1671,131 @@ impl<'a> Socket<'a> {
 
         let old_length = self.tx_buffer.len();
         let (size, result) = f(&mut self.tx_buffer);
+
         if size > 0 {
-            // The connection might have been idle for a long time, and so remote_last_ts
-            // would be far in the past. Unless we clear it here, we'll abort the connection
-            // down over in dispatch() by erroneously detecting it as timed out.
-            if old_length == 0 {
-                self.remote_last_ts = None
+            // Check if DMA is enabled
+            if self.dma_enabled {
+                // Get the payload that was just added
+                let payload_data = self
+                    .tx_buffer
+                    .get_allocated(old_length, old_length + size)
+                    .to_vec();
+
+                // Send payload via DMA and get any autonomously sent data
+                match self.segment_synchronizer.send_data_via_dma(&payload_data) {
+                    Ok(fpga_sent_data) => {
+                        // We need to reorder: FPGA data should come before our data
+                        // First, mark our data position
+                        let our_data_start = old_length;
+                        let our_data_size = size;
+
+                        if let Some(fpga_data) = fpga_sent_data {
+                            tcp_trace!("FPGA autonomously sent {} bytes", fpga_data.len());
+
+                            // We need to insert FPGA data before our data
+                            // Since we can't insert in the middle, we need to:
+                            // 1. Save all data currently in buffer
+                            // 2. Clear buffer
+                            // 3. Re-add in correct order
+
+                            let total_size = old_length + size;
+                            let mut all_data = Vec::with_capacity(total_size + fpga_data.len());
+
+                            // Save existing data (before our send)
+                            if old_length > 0 {
+                                all_data.extend_from_slice(
+                                    &self.tx_buffer.get_allocated(0, old_length),
+                                );
+                            }
+
+                            // Add FPGA data
+                            all_data.extend_from_slice(&fpga_data);
+
+                            // Add our data
+                            all_data.extend_from_slice(&payload_data);
+
+                            // Clear buffer and re-add everything
+                            self.tx_buffer.dequeue_many(total_size);
+                            let requeued = self.tx_buffer.enqueue_already_sent(&all_data);
+
+                            if requeued != all_data.len() {
+                                tcp_trace!(
+                                    "WARNING: Could not re-enqueue all data: {}/{} bytes",
+                                    requeued,
+                                    all_data.len()
+                                );
+                            }
+
+                            // Update sequence number
+                            self.remote_last_seq =
+                                self.remote_last_seq + fpga_data.len() + our_data_size;
+                        } else {
+                            // No FPGA data, just mark our data as already sent
+                            self.tx_buffer
+                                .mark_as_already_sent(our_data_start, our_data_size);
+                            tcp_trace!(
+                                "DMA: Marked bytes {}-{} as already sent",
+                                our_data_start,
+                                our_data_start + our_data_size - 1
+                            );
+                            self.remote_last_seq = self.remote_last_seq + our_data_size;
+                        }
+
+                        // Reset the retransmission timer since we've sent data via FPGA
+                        if !self.timer.is_retransmit() {
+                            let rto = self.rtte.retransmission_timeout();
+                            self.timer.set_for_retransmit(Instant::ZERO, rto);
+                        }
+                    }
+                    Err(_e) => {
+                        // DMA send failed, remove the data we added
+                        self.tx_buffer.dequeue_many(size);
+                        return Err(SendError::InvalidState);
+                    }
+                }
+            } else {
+                // DMA disabled, data stays in tx_buffer and will be sent via ethernet
+                tcp_trace!("DMA disabled, data will be sent via ethernet interface");
+
+                // Handle the remaining post-send logic
+                self.handle_new_data_sent_after_injection(size, old_length)?;
             }
-
-            // if remote win is zero and we go from having no data to some data pending to
-            // send, start the zero window probe timer.
-            if self.remote_win_len == 0 && self.timer.is_idle() {
-                let delay = self.rtte.retransmission_timeout();
-                tcp_trace!("starting zero-window-probe timer for t+{}", delay);
-
-                // We don't have access to the current time here, so use Instant::ZERO instead.
-                // this will cause the first ZWP to be sent immediately, but that's okay.
-                self.timer.set_for_zero_window_probe(Instant::ZERO, delay);
-            }
-
-            #[cfg(any(test, feature = "verbose"))]
-            tcp_trace!(
-                "tx buffer: enqueueing {} octets (now {})",
-                size,
-                old_length + size
-            );
         }
+
         Ok(result)
+    }
+
+    fn handle_new_data_sent_after_injection(
+        &mut self,
+        size: usize,
+        old_length: usize,
+    ) -> Result<(), SendError> {
+        // The connection might have been idle for a long time, and so remote_last_ts
+        // would be far in the past. Unless we clear it here, we'll abort the connection
+        // down over in dispatch() by erroneously detecting it as timed out.
+        if old_length == 0 {
+            self.remote_last_ts = None
+        }
+
+        // if remote win is zero and we go from having no data to some data pending to
+        // send, start the zero window probe timer.
+        if self.remote_win_len == 0 && self.timer.is_idle() {
+            let delay = self.rtte.retransmission_timeout();
+            tcp_trace!("starting zero-window-probe timer for t+{}", delay);
+
+            // We don't have access to the current time here, so use Instant::ZERO instead.
+            // this will cause the first ZWP to be sent immediately, but that's okay.
+            self.timer.set_for_zero_window_probe(Instant::ZERO, delay);
+        }
+
+        #[cfg(any(test, feature = "verbose"))]
+        tcp_trace!(
+            "tx buffer: enqueueing {} octets (now {})",
+            size,
+            old_length + size
+        );
+
+        Ok(())
     }
 
     /// Call `f` with the largest contiguous slice of octets in the transmit buffer,
@@ -1268,9 +1803,10 @@ impl<'a> Socket<'a> {
     ///
     /// This function returns `Err(Error::Illegal)` if the transmit half of
     /// the connection is not open; see [may_send](#method.may_send).
-    pub fn send<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
+    /// CH function potentially adds to buffer
+    pub fn send<F, R>(&mut self, f: F) -> Result<R, SendError>
     where
-        F: FnOnce(&'b mut [u8]) -> (usize, R),
+        F: FnOnce(&mut [u8]) -> (usize, R),
     {
         self.send_impl(|tx_buffer| tx_buffer.enqueue_many_with(f))
     }
@@ -2364,6 +2900,22 @@ impl<'a> Socket<'a> {
             .inner_mut()
             .pre_transmit(cx.now());
 
+        // Poll FPGA for any new autonomous data
+        if self.should_poll_fpga(cx.now()) {
+            if let Some(fpga_data) = self.poll_fpga(cx.now()) {
+                tcp_trace!("Received {} bytes of autonomous FPGA data", fpga_data.len());
+                // Add autonomous data to tx_buffer as already sent
+                let fpga_size = self.tx_buffer.enqueue_already_sent(&fpga_data);
+                if fpga_size != fpga_data.len() {
+                    tcp_trace!(
+                        "WARNING: Could not enqueue all autonomous FPGA data: {}/{} bytes",
+                        fpga_size,
+                        fpga_data.len()
+                    );
+                }
+            }
+        }
+
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
@@ -2372,11 +2924,49 @@ impl<'a> Socket<'a> {
         } else if !self.seq_to_transmit(cx) && self.timer.should_retransmit(cx.now()) {
             // If a retransmit timer expired, we should resend data starting at the last ACK.
             net_debug!("retransmitting");
+            // Save DMA state before retransmission
+            self.dma_was_enabled_before_retransmit = self.dma_enabled;
+            // Disable DMA before retransmission and collect any pending FPGA data
+            if self.dma_was_enabled_before_retransmit {
+                match self.segment_synchronizer.disable_dma() {
+                    Ok(pending_data) => {
+                        self.dma_enabled = false;
+                        if !pending_data.is_empty() {
+                            tcp_trace!(
+                                "Retrieved {} bytes of pending FPGA data before retransmission",
+                                pending_data.len()
+                            );
+                            // Add pending data to tx_buffer as already sent
+                            let fpga_size = self.tx_buffer.enqueue_already_sent(&pending_data);
+                            if fpga_size != pending_data.len() {
+                                tcp_trace!(
+                                    "WARNING: Could not enqueue all pending FPGA data: {}/{} bytes",
+                                    fpga_size,
+                                    pending_data.len()
+                                );
+                            }
+                            // Update sequence number for the FPGA data
+                            self.remote_last_seq = self.remote_last_seq + fpga_size;
+                        }
+                    }
+                    Err(e) => {
+                        net_debug!("Failed to disable DMA for retransmission: {:?}", e);
+                    }
+                }
+            }
 
             // Rewind "last sequence number sent", as if we never
             // had sent them. This will cause all data in the queue
             // to be sent again.
             self.remote_last_seq = self.local_seq_no;
+
+            // Reset the mask for all data in the buffer during retransmission
+            // This ensures that bytes previously marked as "already sent" (e.g., by FPGA)
+            // will be retransmitted. We reset the entire buffer because remote_last_seq
+            // only tracks actually transmitted bytes, not masked bytes.
+            if self.tx_buffer.len() > 0 {
+                self.tx_buffer.reset_mask_range(0, self.tx_buffer.len());
+            }
 
             // Clear the `should_retransmit` state. If we can't retransmit right
             // now for whatever reason (like zero window), this avoids an
@@ -2391,6 +2981,25 @@ impl<'a> Socket<'a> {
             self.congestion_controller
                 .inner_mut()
                 .on_retransmit(cx.now());
+        }
+
+        // Re-enable DMA if it was enabled before retransmission and we're no longer retransmitting
+        if self.dma_was_enabled_before_retransmit
+            && !self.timer.should_retransmit(cx.now())
+            && !self.dma_enabled
+        {
+            // Re-enable DMA with current sequence numbers
+            if let Ok(_) = self
+                .segment_synchronizer
+                .enable_dma(self.remote_last_seq, self.remote_seq_no)
+            {
+                self.dma_enabled = true;
+                tcp_trace!(
+                    "Re-enabled DMA after retransmission completed, with seq num {:?}",
+                    self.local_seq_no
+                );
+                self.dma_was_enabled_before_retransmit = false;
+            }
         }
 
         #[cfg(feature = "socket-tcp-pause-synack")]
@@ -2458,6 +3067,7 @@ impl<'a> Socket<'a> {
             payload: &[],
         };
 
+        let mut transmittable_data = Vec::new();
         let mut is_zero_window_probe = false;
 
         match self.state {
@@ -2527,7 +3137,17 @@ impl<'a> Socket<'a> {
                     .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
 
                 let offset = self.remote_last_seq - self.local_seq_no;
-                repr.payload = self.tx_buffer.get_allocated(offset, size);
+                transmittable_data = self.tx_buffer.get_transmittable(offset, size);
+
+                // Debug output for buffer state
+                tcp_trace!("TCP transmission: offset={}, size={}, buffer_len={}, remote_last_seq={}, local_seq_no={}", 
+                          offset, size, self.tx_buffer.len(), self.remote_last_seq, self.local_seq_no);
+                tcp_trace!(
+                    "Transmittable data: {:?} (len={})",
+                    std::str::from_utf8(&transmittable_data).unwrap_or("<non-utf8>"),
+                    transmittable_data.len()
+                );
+                repr.payload = &transmittable_data;
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
@@ -2698,11 +3318,25 @@ impl<'a> Socket<'a> {
                 (_, _) => PollAt::Ingress,
             };
 
+            let fpga_poll_at = if self.dma_enabled {
+                match self.last_fpga_poll {
+                    None => PollAt::Now, // Never polled before
+                    Some(last_poll) => PollAt::Time(last_poll + FPGA_POLL_INTERVAL),
+                }
+            } else {
+                PollAt::Ingress // DMA disabled, no need to poll
+            };
+
             // We wait for the earliest of our timers to fire.
-            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at]
-                .iter()
-                .min()
-                .unwrap_or(&PollAt::Ingress)
+            *[
+                self.timer.poll_at(),
+                timeout_poll_at,
+                delayed_ack_poll_at,
+                fpga_poll_at,
+            ]
+            .iter()
+            .min()
+            .unwrap_or(&PollAt::Ingress)
         }
     }
 }
@@ -2725,8 +3359,197 @@ impl<'a> fmt::Write for Socket<'a> {
 mod test {
     use super::*;
     use crate::wire::IpRepr;
+    use std::collections::BTreeMap;
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
+
+    // =========================================================================================//
+    // Test Infrastructure for FPGA packet tracking
+    // =========================================================================================//
+
+    /// Test synchronizer that captures packets sent to FPGA for verification
+    #[derive(Debug)]
+    pub struct TestFpgaSynchronizer {
+        // All packets sent by sequence number
+        // The first bool is `fpga_generated`: have they autonomously sent by the FPGA or no
+        // The second bool is `host_read`:  is the host aware of them? (always true for
+        // host-generated packets)
+        // The third bool is `test_consumed`: has the test consumed this packet via recv_fpga?
+        packets: BTreeMap<TcpSeqNumber, (bool, bool, bool, Vec<u8>)>,
+        // State should only be `Some` when dma is enabled; the value is current_seq_number
+        dma_state: Option<TcpSeqNumber>,
+    }
+
+    impl TestFpgaSynchronizer {
+        pub fn new() -> Self {
+            Self {
+                packets: BTreeMap::new(),
+                dma_state: None,
+            }
+        }
+
+        /// Queue data that FPGA will autonomously send
+        pub fn queue_autonomous_data(&mut self, data: Vec<u8>) {
+            if let Some(ref mut seq_number) = self.dma_state {
+                self.packets
+                    .insert(seq_number.clone(), (true, false, false, data.clone()));
+                *seq_number += data.len();
+            } else {
+                panic!("Can only queue autonomous data whilst dma sending is enabled");
+            }
+        }
+
+        // Get all the packets that the host sent
+        pub fn get_host_generated_packets(&self) -> BTreeMap<TcpSeqNumber, Vec<u8>> {
+            self.packets
+                .iter()
+                .filter_map(
+                    |(seq, (fpga_generated, _host_knows, _test_consumed, vec))| {
+                        if !fpga_generated {
+                            Some((*seq, vec.clone()))
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .collect()
+        }
+
+        // Get all the packets that the fpga sent autonomously
+        pub fn get_fpga_generated_packets(&self) -> BTreeMap<TcpSeqNumber, (bool, Vec<u8>)> {
+            self.packets
+                .iter()
+                .filter_map(|(seq, (fpga_generated, host_knows, _test_consumed, vec))| {
+                    if *fpga_generated {
+                        Some((*seq, (*host_knows, vec.clone())))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+
+        // Get all the packets that the fpga sent autonomously
+        pub fn get_new_fpga_generated_packets(&self) -> BTreeMap<TcpSeqNumber, Vec<u8>> {
+            self.get_fpga_generated_packets()
+                .into_iter()
+                .filter_map(|(seq, (host_knows, vec))| {
+                    if !host_knows {
+                        Some((seq, vec.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+
+        pub fn host_read_new_fpga_generated_packet(&mut self) -> Option<Vec<u8>> {
+            // Find the first packet where fpga_generated is true and host_read is false
+            let seq_to_read = self
+                .packets
+                .iter()
+                .find(|(_, (fpga_generated, host_read, _test_consumed, _))| {
+                    *fpga_generated && !*host_read
+                })
+                .map(|(seq, _)| *seq)?;
+
+            // Mark it as read and return the data
+            if let Some((_fpga_generated, ref mut host_read, _test_consumed, ref data)) =
+                self.packets.get_mut(&seq_to_read)
+            {
+                *host_read = true;
+                Some(data.clone())
+            } else {
+                None
+            }
+        }
+
+        pub fn host_read_new_fpga_generated_packets(&mut self) -> Vec<u8> {
+            // Find all packets where fpga_generated is true and host_read is false
+            let unread_seqs: Vec<TcpSeqNumber> = self
+                .packets
+                .iter()
+                .filter(|(_, (fpga_generated, host_read, _test_consumed, _))| {
+                    *fpga_generated && !*host_read
+                })
+                .map(|(seq, _)| *seq)
+                .collect();
+
+            // Mark them all as read and collect their data
+            let mut all_data = Vec::new();
+            for seq in unread_seqs {
+                if let Some((_fpga_generated, ref mut host_read, _test_consumed, ref data)) =
+                    self.packets.get_mut(&seq)
+                {
+                    *host_read = true;
+                    all_data.extend_from_slice(data);
+                }
+            }
+
+            all_data
+        }
+    }
+
+    impl InjectedSegmentSynchronizer for TestFpgaSynchronizer {
+        fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
+            if let Some(ref mut current_seq_num) = self.dma_state {
+                self.packets.insert(
+                    current_seq_num.clone(),
+                    (false, true, false, payload.to_vec()),
+                );
+                *current_seq_num += payload.len();
+            } else {
+                return Err(DmaError::Illegal);
+            }
+            // Return any unread FPGA-generated data
+            let autonomous_data = self.host_read_new_fpga_generated_packets();
+            if autonomous_data.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(autonomous_data))
+            }
+        }
+
+        fn enable_dma(
+            &mut self,
+            seq_num: TcpSeqNumber,
+            ack_num: TcpSeqNumber,
+        ) -> Result<(), DmaError> {
+            self.dma_state = Some(seq_num);
+            tcp_trace!(
+                "DMA enabled for TestFpgaSynchronizer with seq={}, ack={}",
+                seq_num,
+                ack_num
+            );
+            Ok(())
+        }
+
+        fn disable_dma(&mut self) -> Result<Vec<u8>, DmaError> {
+            self.dma_state = None;
+            // Return all pending autonomous data concatenated
+            let new_fpga_generated_packets = self
+                .get_new_fpga_generated_packets()
+                .into_iter()
+                .map(|(_seq_num, data)| data)
+                .flatten()
+                .collect();
+            Ok(new_fpga_generated_packets)
+        }
+
+        fn get_new_autonomous_data(&mut self) -> Result<Option<Vec<u8>>, DmaError> {
+            if self.dma_state.is_none() {
+                return Err(DmaError::Illegal);
+            }
+
+            // Return any unread FPGA-generated data without disabling DMA
+            let autonomous_data = self.host_read_new_fpga_generated_packets();
+            if autonomous_data.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(autonomous_data))
+            }
+        }
+    }
 
     // =========================================================================================//
     // Constants
@@ -2852,6 +3675,10 @@ mod test {
         }
     }
 
+    impl TestSocket {
+        // TestSocket methods removed - using TestFpgaSynchronizer methods directly
+    }
+
     #[track_caller]
     fn send(
         socket: &mut TestSocket,
@@ -2911,12 +3738,22 @@ mod test {
         socket.cx.set_now(timestamp);
 
         let mut fail = false;
-        let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, _| {
-            fail = true;
-            Ok(())
-        });
+        let mut packet_info = None;
+        let result: Result<(), ()> =
+            socket
+                .socket
+                .dispatch(&mut socket.cx, |_, (ip_repr, tcp_repr)| {
+                    fail = true;
+                    // Format the packet information inside the closure
+                    packet_info = Some(format!("IP: {:?}\nTCP: {:?}", ip_repr, tcp_repr));
+                    Ok(())
+                });
         if fail {
-            panic!("Should not send a packet")
+            if let Some(info) = packet_info {
+                panic!("Should not send a packet, but got:\n{}", info);
+            } else {
+                panic!("Should not send a packet")
+            }
         }
 
         assert_eq!(result, Ok(()))
@@ -2966,6 +3803,161 @@ mod test {
     }
 
     #[collapse_debuginfo(yes)]
+    macro_rules! recv_fpga_host_generated {
+        ($socket:expr, $expected_payload:expr) => {{
+            match &mut $socket.socket.segment_synchronizer {
+                AnyInjectedSegmentSynchronizer::Test(ref mut sync) => {
+                    // Find the first packet where fpga_generated=false and test_consumed=false
+                    let seq_to_consume = sync
+                        .packets
+                        .iter()
+                        .find(|(_, (fpga_generated, _host_read, test_consumed, _))| {
+                            !*fpga_generated && !*test_consumed
+                        })
+                        .map(|(seq, _)| *seq)
+                        .expect("Expected host-generated packet but none found");
+
+                    // Mark it as test_consumed and get the data
+                    if let Some((_fpga_generated, _host_read, ref mut test_consumed, ref data)) =
+                        sync.packets.get_mut(&seq_to_consume)
+                    {
+                        *test_consumed = true;
+                        let payload = data.clone();
+                        print!("HOST PAYLOAD: {:?}", payload);
+                        assert_eq!(payload, $expected_payload, "Host packet payload mismatch");
+                    } else {
+                        panic!("Packet disappeared during consumption");
+                    }
+                }
+                _ => panic!("Socket does not have TestFpgaSynchronizer"),
+            }
+        }};
+    }
+
+    #[collapse_debuginfo(yes)]
+    macro_rules! recv_fpga_fpga_generated {
+        ($socket:expr, $expected_payload:expr) => {{
+            match &mut $socket.socket.segment_synchronizer {
+                AnyInjectedSegmentSynchronizer::Test(ref mut sync) => {
+                    // Find the first packet where fpga_generated=true and test_consumed=false
+                    let seq_to_consume = sync
+                        .packets
+                        .iter()
+                        .find(|(_, (fpga_generated, _host_read, test_consumed, _))| {
+                            *fpga_generated && !*test_consumed
+                        })
+                        .map(|(seq, _)| *seq)
+                        .expect("Expected FPGA-generated packet but none found");
+
+                    // Mark it as test_consumed and get the data
+                    if let Some((_fpga_generated, _host_read, ref mut test_consumed, ref data)) =
+                        sync.packets.get_mut(&seq_to_consume)
+                    {
+                        *test_consumed = true;
+                        let payload = data.clone();
+                        print!("FPGA PAYLOAD: {:?}", payload);
+                        assert_eq!(payload, $expected_payload, "FPGA packet payload mismatch");
+                    } else {
+                        panic!("Packet disappeared during consumption");
+                    }
+                }
+                _ => panic!("Socket does not have TestFpgaSynchronizer"),
+            }
+        }};
+    }
+
+    #[collapse_debuginfo(yes)]
+    macro_rules! recv_fpga {
+        ($socket:expr, $expected_payload:expr) => {{
+            match &mut $socket.socket.segment_synchronizer {
+                AnyInjectedSegmentSynchronizer::Test(ref mut sync) => {
+                    // Find the first packet (any type) where test_consumed=false
+                    let seq_to_consume = sync
+                        .packets
+                        .iter()
+                        .find(|(_, (_fpga_generated, _host_read, test_consumed, _))| {
+                            !*test_consumed
+                        })
+                        .map(|(seq, _)| *seq)
+                        .expect("Expected packet but none found");
+
+                    // Mark it as test_consumed and get the data
+                    if let Some((fpga_generated, _host_read, ref mut test_consumed, ref data)) =
+                        sync.packets.get_mut(&seq_to_consume)
+                    {
+                        *test_consumed = true;
+                        let payload = data.clone();
+                        let packet_type = if *fpga_generated { "FPGA" } else { "HOST" };
+                        print!("{} PAYLOAD: {:?}", packet_type, payload);
+                        assert_eq!(payload, $expected_payload, "Packet payload mismatch");
+                    } else {
+                        panic!("Packet disappeared during consumption");
+                    }
+                }
+                _ => panic!("Socket does not have TestFpgaSynchronizer"),
+            }
+        }};
+    }
+
+    #[collapse_debuginfo(yes)]
+    macro_rules! recv_fpga_host_generated_nothing {
+        ($socket:expr) => {{
+            match &mut $socket.socket.segment_synchronizer {
+                AnyInjectedSegmentSynchronizer::Test(ref sync) => {
+                    let has_unconsumed = sync.packets.iter().any(
+                        |(_, (fpga_generated, _host_read, test_consumed, _))| {
+                            !*fpga_generated && !*test_consumed
+                        },
+                    );
+                    assert!(
+                        !has_unconsumed,
+                        "Expected no unconsumed host-generated packets but found some"
+                    );
+                }
+                _ => panic!("Socket does not have TestFpgaSynchronizer"),
+            }
+        }};
+    }
+
+    #[collapse_debuginfo(yes)]
+    macro_rules! recv_fpga_fpga_generated_nothing {
+        ($socket:expr) => {{
+            match &mut $socket.socket.segment_synchronizer {
+                AnyInjectedSegmentSynchronizer::Test(ref sync) => {
+                    let has_unconsumed = sync.packets.iter().any(
+                        |(_, (fpga_generated, _host_read, test_consumed, _))| {
+                            *fpga_generated && !*test_consumed
+                        },
+                    );
+                    assert!(
+                        !has_unconsumed,
+                        "Expected no unconsumed FPGA-generated packets but found some"
+                    );
+                }
+                _ => panic!("Socket does not have TestFpgaSynchronizer"),
+            }
+        }};
+    }
+
+    #[collapse_debuginfo(yes)]
+    macro_rules! recv_fpga_nothing {
+        ($socket:expr) => {{
+            match &mut $socket.socket.segment_synchronizer {
+                AnyInjectedSegmentSynchronizer::Test(ref sync) => {
+                    let has_unconsumed = sync.packets.iter().any(
+                        |(_, (_fpga_generated, _host_read, test_consumed, _))| !*test_consumed,
+                    );
+                    assert!(
+                        !has_unconsumed,
+                        "Expected no unconsumed packets but found some"
+                    );
+                }
+                _ => panic!("Socket does not have TestFpgaSynchronizer"),
+            }
+        }};
+    }
+
+    #[collapse_debuginfo(yes)]
     macro_rules! sanity {
         ($socket1:expr, $socket2:expr) => {{
             let (s1, s2) = ($socket1, $socket2);
@@ -2992,6 +3984,45 @@ mod test {
         let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
         let mut socket = Socket::new(rx_buffer, tx_buffer);
         socket.set_ack_delay(None);
+        TestSocket {
+            socket,
+            cx: iface.inner,
+        }
+    }
+
+    /// Helper function to wait for and verify retransmission in tests
+    ///
+    /// This function assumes:
+    /// - Data has already been sent via send_slice
+    /// - Initial transmission has been received (via recv! or recv_fpga!)
+    /// - No ACK has been sent back (data is unacknowledged)
+    ///
+    /// The function waits for retransmission timeout. Caller should verify
+    /// the retransmitted data if needed.
+    fn wait_for_retransmission(s: &mut TestSocket) {
+        // Since retransmission rewinds remote_last_seq to local_seq_no,
+        // we expect all unacknowledged data to be retransmitted.
+        recv_nothing(s, Instant::from_millis(999)); // Nothing should happen before timeout
+                                                    // Caller should verify specific retransmission at time 1000
+    }
+
+    /// Create a socket with FPGA packet tracking enabled
+    fn socket_with_fpga_tracking() -> TestSocket {
+        socket_with_fpga_tracking_and_buffer_sizes(64, 64)
+    }
+
+    /// Create a socket with FPGA packet tracking and custom buffer sizes
+    fn socket_with_fpga_tracking_and_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
+        let (iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
+
+        let rx_buffer = SocketBuffer::new(vec![0; rx_len]);
+        let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
+        let mut socket = Socket::new(rx_buffer, tx_buffer);
+        socket.set_ack_delay(None);
+
+        let test_sync = TestFpgaSynchronizer::new();
+        socket.segment_synchronizer = AnyInjectedSegmentSynchronizer::Test(test_sync);
+
         TestSocket {
             socket,
             cx: iface.inner,
@@ -3038,6 +4069,20 @@ mod test {
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
+    }
+
+    /// Create an established socket with FPGA packet tracking enabled
+    fn socket_established_with_fpga_tracking() -> TestSocket {
+        let mut s = socket_with_fpga_tracking();
+        s.state = State::Established;
+        s.tuple = Some(TUPLE);
+        s.local_seq_no = LOCAL_SEQ + 1;
+        s.remote_seq_no = REMOTE_SEQ + 1;
+        s.remote_last_seq = LOCAL_SEQ + 1;
+        s.remote_last_ack = Some(REMOTE_SEQ + 1);
+        s.remote_last_win = s.scaled_window();
+        s.remote_win_len = 256;
+        s
     }
 
     fn socket_fin_wait_1() -> TestSocket {
@@ -6751,7 +7796,8 @@ mod test {
     #[test]
     fn test_maximum_segment_size() {
         let mut s = socket_listen();
-        s.tx_buffer = SocketBuffer::new(vec![0; 32767]);
+        let buf = SocketBuffer::new(vec![0; 32767]);
+        s.tx_buffer = MaskedSocketBuffer::new(buf);
         send!(
             s,
             TcpRepr {
@@ -7957,11 +9003,65 @@ mod test {
     }
 
     #[test]
+    fn test_test_injector_inserts_bytes() {
+        let mut s = socket_established();
+        s.set_nagle_enabled(false);
+
+        let buf = SocketBuffer::new(vec![b'.'; 7]);
+        s.tx_buffer = MaskedSocketBuffer::new(buf);
+        let synchronizer = TestFpgaSynchronizer::new();
+        s.set_synchronizer(AnyInjectedSegmentSynchronizer::Test(synchronizer));
+        s.enable_dma().unwrap();
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"*".to_vec());
+        }
+        assert_eq!(s.send_slice(b"a"), Ok(1));
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"*".to_vec());
+        }
+        assert_eq!(s.send_slice(b"b"), Ok(1));
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"*".to_vec());
+        }
+        assert_eq!(s.send_slice(b"c"), Ok(1));
+        assert_eq!(s.tx_buffer.get_allocated(0, 7), b"*a*b*c");
+    }
+
+    #[test]
+    fn test_fpga_generated_payloads_are_being_correctly_inserted() {
+        let mut s = socket_established();
+        s.set_nagle_enabled(false);
+
+        let buf = SocketBuffer::new(vec![b'.'; 14]);
+        s.tx_buffer = MaskedSocketBuffer::new(buf);
+        let synchronizer = TestFpgaSynchronizer::new();
+        s.set_synchronizer(AnyInjectedSegmentSynchronizer::Test(synchronizer));
+        s.enable_dma().unwrap();
+        let fpga_sent = b"***".to_vec();
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(fpga_sent.clone());
+        }
+        let payload = b"aaaa";
+        assert_eq!(s.send_slice(payload), Ok(payload.len()));
+        recv_fpga!(s, fpga_sent);
+        recv_fpga!(s, payload.to_vec());
+        let fpga_sent = b"///".to_vec();
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(fpga_sent.clone());
+        }
+        let payload = b"aaaa";
+        assert_eq!(s.send_slice(payload), Ok(payload.len()));
+        recv_fpga!(s, fpga_sent);
+        recv_fpga!(s, payload.to_vec());
+    }
+
+    #[test]
     fn test_buffer_wraparound_tx() {
         let mut s = socket_established();
         s.set_nagle_enabled(false);
 
-        s.tx_buffer = SocketBuffer::new(vec![b'.'; 9]);
+        let buf = SocketBuffer::new(vec![b'.'; 9]);
+        s.tx_buffer = MaskedSocketBuffer::new(buf);
         assert_eq!(s.send_slice(b"xxxyyy"), Ok(6));
         assert_eq!(s.tx_buffer.dequeue_many(3), &b"xxx"[..]);
         assert_eq!(s.tx_buffer.len(), 3);
@@ -7987,6 +9087,25 @@ mod test {
             })
         );
     }
+
+    // #[test]
+    // fn test_buffer_wraparound_tx() {
+    //     let mut s = socket_established_with_fpga_tracking();
+    //     s.set_nagle_enabled(false);
+
+    //     let buf = SocketBuffer::new(vec![b'.'; 9]);
+    //     s.tx_buffer = MaskedSocketBuffer::new(buf);
+
+    //     assert_eq!(s.send_slice(b"xxxyyy"), Ok(6));
+    //     assert_eq!(s.tx_buffer.dequeue_many(3), &b"xxx"[..]);
+    //     assert_eq!(s.tx_buffer.len(), 3);
+
+    //     // "abcdef" not contiguous in tx buffer
+    //     assert_eq!(s.send_slice(b"abcdef"), Ok(6));
+    //     recv!(s, b"xxxyyy".to_vec());
+    //     recv!(s, b"abcdef".to_vec());
+    //     recv_nothing!(s);
+    // }
 
     // =========================================================================================//
     // Tests for graceful vs ungraceful rx close
@@ -8825,5 +9944,298 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    #[test]
+    fn test_send_data_to_fpga_with_tracking() {
+        let mut s = socket_established_with_fpga_tracking();
+
+        // Enable DMA
+        s.socket.enable_dma().unwrap();
+
+        // Send data via the socket - this should capture it in fpga_packets
+        s.socket.send_slice(b"Hello").unwrap();
+
+        // Verify the packet was sent to FPGA
+        if let AnyInjectedSegmentSynchronizer::Test(ref sync) = s.socket.segment_synchronizer {
+            let packets = sync.get_host_generated_packets();
+            assert_eq!(packets.len(), 1);
+            let (_, payload) = packets.iter().next().unwrap();
+            assert_eq!(payload, b"Hello");
+        } else {
+            panic!("Expected Test synchronizer");
+        }
+
+        // Check that data is in the tx_buffer and marked as already sent
+        assert_eq!(s.socket.tx_buffer.len(), 5);
+        assert_eq!(s.socket.remote_last_seq, s.socket.local_seq_no + 5);
+
+        // Data should be marked as already sent (mask = false)
+        assert!(!s.socket.tx_buffer.is_range_fully_transmittable(0, 5));
+
+        // Verify no packet is sent via interface since it went via FPGA
+        recv!(s, []);
+    }
+
+    #[test]
+    fn test_send_data_to_fpga_with_autonomous_data() {
+        let mut s = socket_established_with_fpga_tracking();
+
+        // Enable DMA
+        s.socket.enable_dma().unwrap();
+
+        // Queue some autonomous FPGA data
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"FPGA".to_vec());
+        }
+
+        // Send data via the socket - this should capture user data in fpga_packets
+        // and return the autonomous data
+        s.socket.send_slice(b"Host").unwrap();
+
+        // Verify the user packet was sent to FPGA
+        if let AnyInjectedSegmentSynchronizer::Test(ref sync) = s.socket.segment_synchronizer {
+            let packets = sync.get_host_generated_packets();
+            assert_eq!(packets.len(), 1);
+            let (_, payload) = packets.iter().next().unwrap();
+            assert_eq!(payload, b"Host");
+        } else {
+            panic!("Expected Test synchronizer");
+        }
+
+        // Check that both FPGA autonomous data and user data are in tx_buffer
+        // FPGA data should come first, then user data
+        assert_eq!(s.socket.tx_buffer.len(), 8); // 4 FPGA bytes + 4 user bytes
+
+        let buffer_data = s.socket.tx_buffer.get_allocated(0, 8);
+        assert_eq!(&buffer_data[0..4], b"FPGA"); // Autonomous FPGA data first
+        assert_eq!(&buffer_data[4..8], b"Host"); // User data second
+
+        // Both should be marked as already sent
+        assert!(!s.socket.tx_buffer.is_range_fully_transmittable(0, 4)); // FPGA data
+        assert!(!s.socket.tx_buffer.is_range_fully_transmittable(4, 4)); // User data
+
+        // Sequence number should reflect both
+        assert_eq!(s.socket.remote_last_seq, s.socket.local_seq_no + 8);
+
+        // Verify no packet is sent via interface since both went via FPGA
+        recv!(s, []);
+    }
+
+    #[test]
+    fn test_simple_retransmission_trigger() {
+        let mut s = socket_established();
+
+        // Send data and receive initial transmission
+        s.send_slice(b"test_data").unwrap();
+        recv!(s, time 0, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"test_data"[..],
+            ..RECV_TEMPL
+        }]);
+
+        // Don't ACK - wait for retransmission
+        wait_for_retransmission(&mut s);
+
+        // Verify retransmission occurs at timeout
+        recv!(s, time 1000, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"test_data"[..],
+            ..RECV_TEMPL
+        }]);
+    }
+
+    #[test]
+    fn test_retransmission_resets_mask() {
+        let mut s = socket_established();
+
+        // Send data
+        s.send_slice(b"test_data").unwrap();
+
+        // Mark some bytes as already sent (simulating FPGA transmission)
+        s.socket.tx_buffer.mark_as_already_sent(0, 5); // Mark "test_" as already sent
+
+        // Verify that only "data" is transmittable (positions 5-8 of "test_data")
+        let transmittable = s.socket.tx_buffer.get_transmittable(0, 9);
+        println!(
+            "Initially transmittable: {:?}",
+            std::str::from_utf8(&transmittable).unwrap()
+        );
+        assert_eq!(transmittable, b"data");
+
+        // Receive initial transmission (only "data" should be sent)
+        recv!(s, time 0, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"data"[..],
+            ..RECV_TEMPL
+        }]);
+
+        // Don't ACK - wait for retransmission
+        wait_for_retransmission(&mut s);
+
+        // So now all of "test_data" should be retransmitted (this triggers retransmission)
+        recv!(s, time 1000, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"test_data"[..],
+            ..RECV_TEMPL
+        }]);
+
+        // After retransmission, verify the mask was reset
+        let retrans_transmittable = s.socket.tx_buffer.get_transmittable(0, 9);
+        println!(
+            "After retrans transmittable: {:?}",
+            std::str::from_utf8(&retrans_transmittable).unwrap()
+        );
+        assert_eq!(retrans_transmittable, b"test_data");
+    }
+
+    #[test]
+    fn test_dma_retransmission_and_reuse_helper() {
+        let mut s = socket_established_with_fpga_tracking();
+
+        // Enable DMA with current sequence numbers
+        s.socket.enable_dma().unwrap();
+
+        // Send data via DMA and receive initial transmission
+        s.socket.send_slice(b"test_data").unwrap();
+        recv_fpga!(s, b"test_data");
+
+        // Don't ACK - wait for retransmission
+        wait_for_retransmission(&mut s);
+
+        // Verify retransmission occurs via normal interface at timeout
+        recv!(s, time 1000, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"test_data"[..],
+            ..RECV_TEMPL
+        }]);
+
+        // After retransmission, DMA should be re-enabled
+        assert!(
+            s.socket.is_dma_enabled(),
+            "DMA should be re-enabled after retransmission"
+        );
+
+        // Send more data via DMA to verify sequence numbers are correct
+        s.socket.send_slice(b"more_data").unwrap();
+        recv_fpga!(s, b"more_data");
+
+        // Test passes if we can successfully use DMA again with correct sequencing
+    }
+
+    #[test]
+    fn test_alternating_dma_on_dma_off() {
+        let mut s = socket_established_with_fpga_tracking();
+        s.set_nagle_enabled(false);
+        let mut expected_seq = s.socket.remote_last_seq;
+
+        // We are going to send four packets, two via DMA and two via the interface
+        let slice = b"iface1";
+        s.socket.send_slice(slice).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: expected_seq,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &slice[..],
+                ..RECV_TEMPL
+            }]
+        );
+        expected_seq += slice.len();
+
+        let slice = b"dma1";
+        s.socket.enable_dma().unwrap();
+        s.socket.send_slice(slice).unwrap();
+        recv_fpga!(s, slice.to_vec());
+        expected_seq += slice.len();
+
+        let slice = b"iface2";
+        assert_eq!(Vec::<u8>::new(), s.socket.disable_dma().unwrap());
+        s.socket.send_slice(slice).unwrap();
+
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: expected_seq,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &slice[..],
+                ..RECV_TEMPL
+            }]
+        );
+        expected_seq += slice.len();
+
+        let slice = b"dma2";
+        s.socket.enable_dma().unwrap();
+        s.socket.send_slice(slice).unwrap();
+        recv_fpga!(s, slice.to_vec());
+        expected_seq += slice.len();
+    }
+
+    #[test]
+    fn test_sequence_numbers_correctly_maintained() {
+        let mut s = socket_established_with_fpga_tracking();
+        s.set_nagle_enabled(false);
+
+        let mut expected_seq = s.socket.remote_last_seq;
+
+        // We are going to send some packets via DMA
+        let slice = b"dma1";
+        s.socket.enable_dma().unwrap();
+        s.socket.send_slice(slice).unwrap();
+        recv_fpga!(s, slice.to_vec());
+        expected_seq += slice.len();
+
+        let slice = b"dma2";
+        s.socket.send_slice(slice).unwrap();
+        recv_fpga!(s, slice.to_vec());
+        expected_seq += slice.len();
+
+        // Wait for retransmission to occur
+        wait_for_retransmission(&mut s);
+
+        assert_eq!(s.socket.remote_last_seq, expected_seq);
+    }
+
+    // Test that the sequence numbers are being correctly maintained between host and FPGA.
+    // Whilst DMA sending is on, both the host and FPGA are maintaining their own records of
+    // what the next sequence number is. We need to make sure that these match.
+    #[test]
+    fn test_sequence_numbers_maintained() {
+        let mut s = socket_established_with_fpga_tracking();
+
+        // Enable DMA
+        s.socket.enable_dma().unwrap();
+
+        print!("{}", s.socket.local_seq_no);
+
+        s.socket.send_slice(b"first").unwrap();
+
+        print!("{}", s.socket.local_seq_no);
+
+        // Queue some autonomous FPGA data
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"second".to_vec());
+            sync.queue_autonomous_data(b"third".to_vec());
+        }
+
+        s.socket.send_slice(b"fourth").unwrap();
+
+        // Capture the current sequence number, according to the FPGA
+        let fpga_seq_num =
+            if let AnyInjectedSegmentSynchronizer::Test(ref sync) = s.socket.segment_synchronizer {
+                if let Some(seq_num) = sync.dma_state {
+                    seq_num
+                } else {
+                    panic!("Couldn't get seq num from FPGA");
+                }
+            } else {
+                panic!("Couldn't get seq num from FPGA");
+            };
+        assert_eq!(fpga_seq_num, s.socket.remote_last_seq);
     }
 }
