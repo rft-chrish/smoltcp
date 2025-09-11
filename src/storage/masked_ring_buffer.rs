@@ -137,6 +137,18 @@ impl<'a> MaskedSocketBuffer<'a> {
             .collect()
     }
 
+    /// Check if any bytes in the given range are masked (not transmittable).
+    /// 
+    /// Returns true if all bytes in the range should be transmitted (no masking).
+    pub fn is_range_fully_transmittable(&self, offset: usize, size: usize) -> bool {
+        for i in offset..offset + size {
+            if i >= self.mask.len() || !self.mask[i] {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Get an allocated slice from the buffer (ignoring mask).
     /// 
     /// This is useful for operations that need to see all data regardless of

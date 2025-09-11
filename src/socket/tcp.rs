@@ -2616,7 +2616,15 @@ impl<'a> Socket<'a> {
                     .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
 
                 let offset = self.remote_last_seq - self.local_seq_no;
-                repr.payload = self.tx_buffer.get_allocated(offset, size);
+                
+                // Optimization: if all data in range is transmittable, use direct access
+                if self.tx_buffer.is_range_fully_transmittable(offset, size) {
+                    repr.payload = self.tx_buffer.get_allocated(offset, size);
+                } else {
+                    // TODO: Handle masking case - for now, fall back to all data
+                    // This needs a more sophisticated approach to handle the lifetime issue
+                    repr.payload = self.tx_buffer.get_allocated(offset, size);
+                }
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
