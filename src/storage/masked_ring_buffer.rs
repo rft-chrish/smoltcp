@@ -1,11 +1,11 @@
 use crate::storage::RingBuffer;
+use core::fmt;
 
 /// A ring buffer with transmission masking capability.
 /// 
 /// This buffer allows marking specific bytes as "already transmitted" (e.g., by NIC hardware)
 /// so they won't be transmitted again by the software stack, while still maintaining them
 /// in the buffer for potential retransmission.
-#[derive(Debug)]
 pub struct MaskedSocketBuffer<'a> {
     buffer: RingBuffer<'a, u8>,
     /// Mask indicating which bytes should be transmitted.
@@ -45,6 +45,15 @@ impl<'a> MaskedSocketBuffer<'a> {
     #[inline]
     pub fn len(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// Return the number of bytes that should be transmitted (where mask is true).
+    pub fn len_to_transmit(&self) -> usize {
+        let buffer_len = self.buffer.len();
+        self.mask.iter()
+            .take(buffer_len)
+            .filter(|&&transmit| transmit)
+            .count()
     }
 
     /// Return the number of elements that can be read.
@@ -141,12 +150,12 @@ impl<'a> MaskedSocketBuffer<'a> {
     /// 
     /// Returns true if all bytes in the range should be transmitted (no masking).
     pub fn is_range_fully_transmittable(&self, offset: usize, size: usize) -> bool {
-        for i in offset..offset + size {
-            if i >= self.mask.len() || !self.mask[i] {
-                return false;
-            }
+        let range_end = offset + size;
+        if range_end > self.buffer.len() {
+            return false;
         }
-        true
+        
+        self.mask[offset..range_end].iter().all(|&transmit| transmit)
     }
 
     /// Get an allocated slice from the buffer (ignoring mask).
@@ -173,6 +182,46 @@ impl<'a> MaskedSocketBuffer<'a> {
         }
         
         dequeued_slice
+    }
+
+    /// Dequeue enough data to get the specified number of transmittable bytes.
+    /// 
+    /// Returns (transmittable_bytes, untransmittable_bytes) where:
+    /// - transmittable_bytes: Vec containing only the transmittable bytes
+    /// - untransmittable_bytes: Vec containing any masked bytes that were dequeued
+    /// 
+    /// This method will dequeue as many bytes as necessary from the start of the buffer
+    /// to collect `transmittable_count` transmittable bytes.
+    pub fn dequeue_transmittable(&mut self, transmittable_count: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut transmittable_bytes = Vec::new();
+        let mut untransmittable_bytes = Vec::new();
+        let mut total_to_dequeue = 0;
+        
+        // Scan through buffer to find how many bytes we need to dequeue
+        let buffer_len = self.buffer.len();
+        for i in 0..buffer_len {
+            if transmittable_bytes.len() >= transmittable_count {
+                break;
+            }
+            
+            let data_byte = self.buffer.get_allocated(i, 1)[0];
+            total_to_dequeue += 1;
+            
+            if i < self.mask.len() && self.mask[i] {
+                // Transmittable byte
+                transmittable_bytes.push(data_byte);
+            } else {
+                // Masked/untransmittable byte
+                untransmittable_bytes.push(data_byte);
+            }
+        }
+        
+        // Actually dequeue the bytes from the buffer
+        if total_to_dequeue > 0 {
+            let _ = self.dequeue_many(total_to_dequeue);
+        }
+        
+        (transmittable_bytes, untransmittable_bytes)
     }
 
     /// Call `f` with the largest contiguous slice of octets and dequeue
@@ -269,6 +318,58 @@ impl<'a> From<RingBuffer<'a, u8>> for MaskedSocketBuffer<'a> {
     }
 }
 
+impl<'a> fmt::Debug for MaskedSocketBuffer<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let buffer_len = self.buffer.len();
+        
+        if buffer_len == 0 {
+            return write!(f, "MaskedSocketBuffer {{ empty }}");
+        }
+        
+        // Build debug representation showing data and mask status
+        let mut content = String::with_capacity(buffer_len * 4);
+        
+        // Get data byte by byte to handle wraparound properly
+        for i in 0..buffer_len {
+            if i > 0 {
+                content.push(' ');
+            }
+            
+            // Get a single byte at position i
+            let byte_slice = self.buffer.get_allocated(i, 1);
+            if byte_slice.is_empty() {
+                // This shouldn't happen if buffer_len is correct
+                content.push_str("??");
+                continue;
+            }
+            let byte = byte_slice[0];
+            
+            let is_transmittable = i < self.mask.len() && self.mask[i];
+            
+            if is_transmittable {
+                // Transmittable bytes shown normally
+                if byte.is_ascii_graphic() || byte == b' ' {
+                    content.push_str(&format!("'{}'", byte as char));
+                } else {
+                    content.push_str(&format!("{:02x}", byte));
+                }
+            } else {
+                // Masked bytes shown with brackets
+                if byte.is_ascii_graphic() || byte == b' ' {
+                    content.push_str(&format!("['{}'']", byte as char));
+                } else {
+                    content.push_str(&format!("[{:02x}]", byte));
+                }
+            }
+        }
+        
+        let (transmittable_count, total_count) = (self.len_to_transmit(), buffer_len);
+        
+        write!(f, "MaskedSocketBuffer {{ {}/{} transmittable: {} }}", 
+               transmittable_count, total_count, content)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +440,85 @@ mod tests {
         // Now positions should be shifted: "def" where "d" is not transmittable, "ef" are transmittable
         let transmittable = buffer.get_transmittable(0, 3);
         assert_eq!(transmittable, b"ef");
+    }
+
+    #[test]
+    fn test_dequeue_transmittable() {
+        let mut buffer = MaskedSocketBuffer::new(RingBuffer::new(vec![0u8; 16]));
+        
+        // Setup buffer: exxxyyy where "e" is masked (from WrongSynchronizer simulation)
+        buffer.enqueue_already_sent(b"e");  // masked byte first
+        buffer.enqueue_slice(b"xxxyyy");    // normal bytes
+        
+        // Verify buffer state
+        assert_eq!(buffer.len(), 7);
+        assert_eq!(buffer.len_to_transmit(), 6); // only "xxxyyy" should be transmittable
+        
+        // Show debug output
+        println!("Buffer state: {:?}", buffer);
+        
+        // Dequeue 3 transmittable bytes
+        let (transmittable, masked) = buffer.dequeue_transmittable(3);
+        assert_eq!(transmittable, b"xxx");
+        assert_eq!(masked, b"e");
+        
+        // Buffer should now have "yyy" remaining
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer.len_to_transmit(), 3);
+        
+        println!("After dequeue: {:?}", buffer);
+        
+        // Get remaining transmittable data
+        let remaining = buffer.get_transmittable(0, 3);
+        assert_eq!(remaining, b"yyy");
+    }
+
+    #[test]
+    fn test_debug_output() {
+        let mut buffer = MaskedSocketBuffer::new(RingBuffer::new(vec![0u8; 16]));
+        
+        // Test empty buffer
+        println!("Empty: {:?}", buffer);
+        
+        // Test mixed content
+        buffer.enqueue_slice(b"ABC");       // transmittable
+        buffer.enqueue_already_sent(b"xy");  // masked
+        buffer.enqueue_slice(b"123");       // transmittable
+        
+        println!("Mixed: {:?}", buffer);
+        
+        // Test with non-ASCII bytes
+        buffer.enqueue_already_sent(&[0xFF, 0x00]); // masked non-ASCII
+        buffer.enqueue_slice(&[0x0A, 0x20]);       // transmittable non-ASCII
+        
+        println!("With non-ASCII: {:?}", buffer);
+    }
+
+    #[test]
+    fn test_debug_with_wraparound() {
+        let mut buffer = MaskedSocketBuffer::new(RingBuffer::new(vec![0u8; 8]));
+        
+        // Fill buffer with some data
+        buffer.enqueue_slice(b"abcdef"); // 6 bytes
+        
+        // Dequeue some to create wraparound scenario
+        let _ = buffer.dequeue_many(4); // Remove "abcd", leaves "ef"
+        
+        // Add more data that will wrap around
+        buffer.enqueue_already_sent(b"X"); // masked
+        buffer.enqueue_slice(b"12345");   // will wrap around
+        
+        println!("Wraparound buffer: {:?}", buffer);
+        
+        // Verify the debug output shows all data
+        let debug_str = format!("{:?}", buffer);
+        assert!(debug_str.contains("'e'"));
+        assert!(debug_str.contains("'f'"));
+        assert!(debug_str.contains("['X'']"));
+        assert!(debug_str.contains("'1'"));
+        assert!(debug_str.contains("'2'"));
+        assert!(debug_str.contains("'3'"));
+        assert!(debug_str.contains("'4'"));
+        assert!(debug_str.contains("'5'"));
     }
 }

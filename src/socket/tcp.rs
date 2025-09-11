@@ -10,7 +10,7 @@ use core::{fmt, mem};
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt};
-use crate::storage::{Assembler, RingBuffer, MaskedSocketBuffer};
+use crate::storage::{Assembler, MaskedSocketBuffer, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber,
@@ -126,11 +126,21 @@ impl InjectedSegmentSynchronizer for NoOpSynchronizer {
 
 /// A synchronizer that never injects any segments
 #[derive(Debug)]
-pub struct WrongSynchronizer;
+pub struct MockSynchronizer {
+    injection_str: Vec<u8>,
+}
 
-impl InjectedSegmentSynchronizer for WrongSynchronizer {
+impl MockSynchronizer {
+    pub fn new(inj_str: &str) -> Self {
+        Self {
+            injection_str: inj_str.into(),
+        }
+    }
+}
+
+impl InjectedSegmentSynchronizer for MockSynchronizer {
     fn sync_tx(&mut self, _upcoming_send_len: usize) -> Option<Vec<u8>> {
-        Some(b"e".to_vec())
+        Some(self.injection_str.clone())
     }
 }
 
@@ -138,14 +148,14 @@ impl InjectedSegmentSynchronizer for WrongSynchronizer {
 #[derive(Debug)]
 pub enum AnyInjectedSegmentSynchronizer {
     NoOp(NoOpSynchronizer),
-    Wrong(WrongSynchronizer),
+    Mock(MockSynchronizer),
 }
 
 impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
     fn sync_tx(&mut self, upcoming_send_len: usize) -> Option<Vec<u8>> {
         match self {
             Self::NoOp(sync) => sync.sync_tx(upcoming_send_len),
-            Self::Wrong(sync) => sync.sync_tx(upcoming_send_len),
+            Self::Mock(sync) => sync.sync_tx(upcoming_send_len),
         }
     }
 }
@@ -673,6 +683,10 @@ impl<'a> Socket<'a> {
 
             segment_synchronizer: AnyInjectedSegmentSynchronizer::default(),
         }
+    }
+
+    pub fn set_synchronizer(&mut self, synchronizer: AnyInjectedSegmentSynchronizer) {
+        self.segment_synchronizer = synchronizer;
     }
 
     /// Enable or disable TCP Timestamp.
@@ -1293,34 +1307,44 @@ impl<'a> Socket<'a> {
         }
 
         let old_length = self.tx_buffer.len();
-        let (size, result) = f(&mut self.tx_buffer);
-        
-        // Handle the size > 0 case after the closure's lifetime ends
-        if size > 0 {
-            self.handle_new_data_sent(size, old_length)?;
-        }
-        
-        Ok(result)
-    }
-    
-    fn handle_new_data_sent(&mut self, size: usize, old_length: usize) -> Result<(), SendError> {
-        // Check for externally injected segments
-        if let Some(injected_data) = self.segment_synchronizer.sync_tx(size) {
+
+        // Check for externally injected segments BEFORE user data
+        // We need to estimate the size that will be added by the closure
+        if let Some(injected_data) = self.segment_synchronizer.sync_tx(0) {
             tcp_trace!("external injector provided {} bytes", injected_data.len());
-            
+
             // Add the externally-sent data to our tx_buffer using the masked buffer method
             let injected_size = self.tx_buffer.enqueue_already_sent(&injected_data);
             if injected_size != injected_data.len() {
-                tcp_trace!("WARNING: Could not enqueue all injected data: {}/{} bytes", 
-                          injected_size, injected_data.len());
+                tcp_trace!(
+                    "WARNING: Could not enqueue all injected data: {}/{} bytes",
+                    injected_size,
+                    injected_data.len()
+                );
             }
-            
+
             if injected_size > 0 {
                 // Advance remote_last_seq for the injected data
                 self.remote_last_seq = self.remote_last_seq + injected_size;
             }
         }
-        
+
+        // Now let the user closure operate on buffer that includes injected data
+        let (size, result) = f(&mut self.tx_buffer);
+
+        // Handle the remaining post-send logic
+        if size > 0 {
+            self.handle_new_data_sent_after_injection(size, old_length)?;
+        }
+
+        Ok(result)
+    }
+
+    fn handle_new_data_sent_after_injection(
+        &mut self,
+        size: usize,
+        old_length: usize,
+    ) -> Result<(), SendError> {
         // The connection might have been idle for a long time, and so remote_last_ts
         // would be far in the past. Unless we clear it here, we'll abort the connection
         // down over in dispatch() by erroneously detecting it as timed out.
@@ -1345,7 +1369,7 @@ impl<'a> Socket<'a> {
             size,
             old_length + size
         );
-        
+
         Ok(())
     }
 
@@ -1368,14 +1392,12 @@ impl<'a> Socket<'a> {
     /// by the amount of free space in the transmit buffer; down to zero.
     ///
     /// See also [send](#method.send).
-    /// CH function potentially adds to buffer
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
         self.send_impl(|tx_buffer| {
             let size = tx_buffer.enqueue_slice(data);
             (size, size)
         })
     }
-
 
     fn recv_error_check(&mut self) -> Result<(), RecvError> {
         // We may have received some data inside the initial SYN, but until the connection
@@ -2547,6 +2569,7 @@ impl<'a> Socket<'a> {
             payload: &[],
         };
 
+        let mut transmittable_data = Vec::new();
         let mut is_zero_window_probe = false;
 
         match self.state {
@@ -2616,15 +2639,8 @@ impl<'a> Socket<'a> {
                     .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
 
                 let offset = self.remote_last_seq - self.local_seq_no;
-                
-                // Optimization: if all data in range is transmittable, use direct access
-                if self.tx_buffer.is_range_fully_transmittable(offset, size) {
-                    repr.payload = self.tx_buffer.get_allocated(offset, size);
-                } else {
-                    // TODO: Handle masking case - for now, fall back to all data
-                    // This needs a more sophisticated approach to handle the lifetime issue
-                    repr.payload = self.tx_buffer.get_allocated(offset, size);
-                }
+                transmittable_data = self.tx_buffer.get_transmittable(offset, size);
+                repr.payload = &transmittable_data;
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
@@ -8052,6 +8068,57 @@ mod test {
         let mut data = [0; 6];
         assert_eq!(s.recv_slice(&mut data[..]), Ok(6));
         assert_eq!(data, &b"defghi"[..]);
+    }
+
+    #[test]
+    fn test_wrong_injector_inserts_bytes() {
+        let mut s = socket_established();
+        s.set_nagle_enabled(false);
+
+        let buf = SocketBuffer::new(vec![b'.'; 7]);
+        s.tx_buffer = MaskedSocketBuffer::new(buf);
+        let synchronizer = MockSynchronizer::new("*");
+        s.set_synchronizer(AnyInjectedSegmentSynchronizer::Mock(synchronizer));
+        assert_eq!(s.send_slice(b"a"), Ok(1));
+        assert_eq!(s.send_slice(b"b"), Ok(1));
+        assert_eq!(s.send_slice(b"c"), Ok(1));
+        assert_eq!(s.tx_buffer.get_allocated(0, 7), b"*a*b*c");
+    }
+
+    #[test]
+    fn test_wrong_injector_skips_sequence_numbers() {
+        let mut s = socket_established();
+        s.set_nagle_enabled(false);
+
+        let buf = SocketBuffer::new(vec![b'.'; 14]);
+        s.tx_buffer = MaskedSocketBuffer::new(buf);
+        let sync_str = "***";
+        let sync_str_len = sync_str.len();
+        let synchronizer = MockSynchronizer::new(sync_str);
+        s.set_synchronizer(AnyInjectedSegmentSynchronizer::Mock(synchronizer));
+        let seq_num = LOCAL_SEQ + sync_str_len + 1;
+        let payload = b"aaaa";
+        assert_eq!(s.send_slice(payload), Ok(payload.len()));
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: seq_num,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &payload[..],
+                ..RECV_TEMPL
+            })
+        );
+        let seq_num = seq_num + payload.len() + sync_str_len;
+        assert_eq!(s.send_slice(b"bbb"), Ok(3));
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: seq_num,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"bbb"[..],
+                ..RECV_TEMPL
+            })
+        );
     }
 
     #[test]
