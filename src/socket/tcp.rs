@@ -10,7 +10,7 @@ use core::{fmt, mem};
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt};
-use crate::storage::{Assembler, RingBuffer};
+use crate::storage::{Assembler, RingBuffer, MaskedSocketBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber,
@@ -104,6 +104,9 @@ impl std::error::Error for RecvError {}
 /// A TCP socket ring buffer.
 pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
 
+/// A TCP socket ring buffer with masking capability for handling NIC-injected segments.
+pub type MaskedTxBuffer<'a> = MaskedSocketBuffer<'a>;
+
 /// Trait for synchronizing with NICs that can autonomously inject TCP segments
 pub trait InjectedSegmentSynchronizer {
     /// Notify of upcoming send and retrieve any autonomously injected data
@@ -149,7 +152,8 @@ impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
 
 impl Default for AnyInjectedSegmentSynchronizer {
     fn default() -> Self {
-        Self::Wrong(WrongSynchronizer)
+        Self::NoOp(NoOpSynchronizer)
+        // Self::Wrong(WrongSynchronizer)
     }
 }
 
@@ -519,7 +523,7 @@ pub struct Socket<'a> {
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
-    tx_buffer: SocketBuffer<'a>,
+    tx_buffer: MaskedTxBuffer<'a>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
     /// Interval at which keep-alive packets will be sent.
@@ -610,7 +614,8 @@ impl<'a> Socket<'a> {
     where
         T: Into<SocketBuffer<'a>>,
     {
-        let (rx_buffer, tx_buffer) = (rx_buffer.into(), tx_buffer.into());
+        let rx_buffer = rx_buffer.into();
+        let tx_buffer = MaskedTxBuffer::from(tx_buffer.into());
         let rx_capacity = rx_buffer.capacity();
 
         // From RFC 1323:
@@ -1281,7 +1286,7 @@ impl<'a> Socket<'a> {
     /// CH function potentially adds to buffer
     fn send_impl<F, R>(&mut self, f: F) -> Result<R, SendError>
     where
-        F: FnOnce(&mut SocketBuffer<'a>) -> (usize, R),
+        F: FnOnce(&mut MaskedTxBuffer<'a>) -> (usize, R),
     {
         if !self.may_send() {
             return Err(SendError::InvalidState);
@@ -1303,18 +1308,16 @@ impl<'a> Socket<'a> {
         if let Some(injected_data) = self.segment_synchronizer.sync_tx(size) {
             tcp_trace!("external injector provided {} bytes", injected_data.len());
             
-            // Add the externally-sent data to our tx_buffer
-            match self.enqueue_already_sent(&injected_data) {
-                Ok(injected_size) => {
-                    if injected_size != injected_data.len() {
-                        tcp_trace!("WARNING: Could not enqueue all injected data: {}/{} bytes", 
-                                  injected_size, injected_data.len());
-                    }
-                }
-                Err(e) => {
-                    tcp_trace!("ERROR: Failed to enqueue injected data: {:?}", e);
-                    return Err(e);
-                }
+            // Add the externally-sent data to our tx_buffer using the masked buffer method
+            let injected_size = self.tx_buffer.enqueue_already_sent(&injected_data);
+            if injected_size != injected_data.len() {
+                tcp_trace!("WARNING: Could not enqueue all injected data: {}/{} bytes", 
+                          injected_size, injected_data.len());
+            }
+            
+            if injected_size > 0 {
+                // Advance remote_last_seq for the injected data
+                self.remote_last_seq = self.remote_last_seq + injected_size;
             }
         }
         
@@ -1373,32 +1376,6 @@ impl<'a> Socket<'a> {
         })
     }
 
-    /// Enqueue data that has already been sent by external means (e.g., NIC)
-    /// This updates tx_buffer for ACK tracking but doesn't trigger transmission
-    /// since the data has already been sent.
-    ///
-    /// This function returns the amount of octets actually enqueued, which is limited
-    /// by the amount of free space in the transmit buffer; down to zero.
-    pub fn enqueue_already_sent(&mut self, data: &[u8]) -> Result<usize, SendError> {
-        if !self.may_send() {
-            return Err(SendError::InvalidState);
-        }
-
-        let size = self.tx_buffer.enqueue_slice(data);
-        if size > 0 {
-            // Key difference: immediately advance remote_last_seq
-            self.remote_last_seq = self.remote_last_seq + size;
-            
-            #[cfg(any(test, feature = "verbose"))]
-            tcp_trace!(
-                "tx buffer: enqueueing {} octets already sent externally (remote_last_seq now {})",
-                size,
-                self.remote_last_seq
-            );
-        }
-        
-        Ok(size)
-    }
 
     fn recv_error_check(&mut self) -> Result<(), RecvError> {
         // We may have received some data inside the initial SYN, but until the connection
@@ -6863,7 +6840,8 @@ mod test {
     #[test]
     fn test_maximum_segment_size() {
         let mut s = socket_listen();
-        s.tx_buffer = SocketBuffer::new(vec![0; 32767]);
+        let buf = SocketBuffer::new(vec![0; 32767]);
+        s.tx_buffer = MaskedSocketBuffer::new(buf);
         send!(
             s,
             TcpRepr {
@@ -8073,7 +8051,9 @@ mod test {
         let mut s = socket_established();
         s.set_nagle_enabled(false);
 
-        s.tx_buffer = SocketBuffer::new(vec![b'.'; 9]);
+        let buf = SocketBuffer::new(vec![b'.'; 9]);
+        s.tx_buffer = MaskedSocketBuffer::new(buf);
+
         assert_eq!(s.send_slice(b"xxxyyy"), Ok(6));
         assert_eq!(s.tx_buffer.dequeue_many(3), &b"xxx"[..]);
         assert_eq!(s.tx_buffer.len(), 3);
