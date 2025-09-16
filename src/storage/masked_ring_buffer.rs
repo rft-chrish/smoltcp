@@ -303,6 +303,26 @@ impl<'a> MaskedSocketBuffer<'a> {
         }
     }
 
+    /// Get a slice of data from the buffer (ignoring mask) as a Vec.
+    /// 
+    /// This is useful when you need the actual data regardless of mask state.
+    pub fn get_unmasked(&self, offset: usize, end: usize) -> Vec<u8> {
+        let size = end - offset;
+        self.buffer.get_allocated(offset, size).to_vec()
+    }
+    
+    /// Mark a range of already-enqueued data as "already sent".
+    /// 
+    /// This is used when data in the buffer has been sent externally (e.g., by FPGA).
+    pub fn mark_as_already_sent(&mut self, offset: usize, size: usize) {
+        let range_end = offset + size;
+        for i in offset..range_end {
+            if i < self.mask.len() {
+                self.mask[i] = false;
+            }
+        }
+    }
+
     /// Get debug information about the mask state.
     #[cfg(any(test, feature = "verbose"))]
     pub fn mask_debug_info(&self) -> (usize, usize) {
