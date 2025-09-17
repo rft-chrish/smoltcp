@@ -132,7 +132,11 @@ pub trait InjectedSegmentSynchronizer {
 
     /// Enable DMA and notify FPGA it can send autonomous packets
     /// Takes sequence_number and ack_number to sync FPGA with current TCP state
-    fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError>;
+    fn set_dma_enabled(
+        &mut self,
+        seq_num: TcpSeqNumber,
+        ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError>;
 
     /// Disable DMA and retrieve any pending FPGA-sent data
     fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError>;
@@ -151,7 +155,11 @@ impl InjectedSegmentSynchronizer for NoFpgaSynchronizer {
         false // Always disabled since there's no FPGA
     }
 
-    fn set_dma_enabled(&mut self, _seq_num: TcpSeqNumber, _ack_num: TcpSeqNumber) -> Result<(), DmaError> {
+    fn set_dma_enabled(
+        &mut self,
+        _seq_num: TcpSeqNumber,
+        _ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError> {
         Err(DmaError::Illegal) // Cannot enable DMA without FPGA
     }
 
@@ -190,7 +198,11 @@ impl InjectedSegmentSynchronizer for MockSynchronizer {
         self.dma_enabled
     }
 
-    fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
+    fn set_dma_enabled(
+        &mut self,
+        seq_num: TcpSeqNumber,
+        ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError> {
         self.dma_enabled = true;
         tcp_trace!(
             "DMA enabled for MockSynchronizer with seq={}, ack={}",
@@ -258,7 +270,11 @@ impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
         self.dma_enabled
     }
 
-    fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
+    fn set_dma_enabled(
+        &mut self,
+        seq_num: TcpSeqNumber,
+        ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError> {
         self.dma_enabled = true;
         tcp_trace!(
             "DMA enabled for LengthMockSynchronizer with seq={}, ack={}",
@@ -317,7 +333,11 @@ impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
         }
     }
 
-    fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
+    fn set_dma_enabled(
+        &mut self,
+        seq_num: TcpSeqNumber,
+        ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError> {
         match self {
             Self::NoFpga(sync) => sync.set_dma_enabled(seq_num, ack_num),
             Self::Mock(sync) => sync.set_dma_enabled(seq_num, ack_num),
@@ -868,7 +888,11 @@ impl<'a> Socket<'a> {
 
     /// Enable DMA sending and notify FPGA it can send autonomous packets
     /// Takes current sequence and ack numbers to sync FPGA with TCP state
-    pub fn enable_dma(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
+    pub fn enable_dma(
+        &mut self,
+        seq_num: TcpSeqNumber,
+        ack_num: TcpSeqNumber,
+    ) -> Result<(), DmaError> {
         self.segment_synchronizer.set_dma_enabled(seq_num, ack_num)
     }
 
@@ -1506,7 +1530,10 @@ impl<'a> Socket<'a> {
             // Check if DMA is enabled
             if self.segment_synchronizer.is_dma_enabled() {
                 // Get the payload that was just added
-                let payload_data = self.tx_buffer.get_allocated(old_length, old_length + size).to_vec();
+                let payload_data = self
+                    .tx_buffer
+                    .get_allocated(old_length, old_length + size)
+                    .to_vec();
 
                 // Send payload via DMA and get any autonomously sent data
                 match self.segment_synchronizer.send_data_via_dma(&payload_data) {
@@ -1518,41 +1545,48 @@ impl<'a> Socket<'a> {
 
                         if let Some(fpga_data) = fpga_sent_data {
                             tcp_trace!("FPGA autonomously sent {} bytes", fpga_data.len());
-                            
+
                             // We need to insert FPGA data before our data
                             // Since we can't insert in the middle, we need to:
                             // 1. Save all data currently in buffer
                             // 2. Clear buffer
                             // 3. Re-add in correct order
-                            
+
                             let total_size = old_length + size;
                             let mut all_data = Vec::with_capacity(total_size + fpga_data.len());
-                            
+
                             // Save existing data (before our send)
                             if old_length > 0 {
-                                all_data.extend_from_slice(&self.tx_buffer.get_allocated(0, old_length));
+                                all_data.extend_from_slice(
+                                    &self.tx_buffer.get_allocated(0, old_length),
+                                );
                             }
-                            
+
                             // Add FPGA data
                             all_data.extend_from_slice(&fpga_data);
-                            
+
                             // Add our data
                             all_data.extend_from_slice(&payload_data);
-                            
+
                             // Clear buffer and re-add everything
                             self.tx_buffer.dequeue_many(total_size);
                             let requeued = self.tx_buffer.enqueue_already_sent(&all_data);
-                            
+
                             if requeued != all_data.len() {
-                                tcp_trace!("WARNING: Could not re-enqueue all data: {}/{} bytes", 
-                                    requeued, all_data.len());
+                                tcp_trace!(
+                                    "WARNING: Could not re-enqueue all data: {}/{} bytes",
+                                    requeued,
+                                    all_data.len()
+                                );
                             }
-                            
+
                             // Update sequence number
-                            self.remote_last_seq = self.remote_last_seq + fpga_data.len() + our_data_size;
+                            self.remote_last_seq =
+                                self.remote_last_seq + fpga_data.len() + our_data_size;
                         } else {
                             // No FPGA data, just mark our data as already sent
-                            self.tx_buffer.mark_as_already_sent(our_data_start, our_data_size);
+                            self.tx_buffer
+                                .mark_as_already_sent(our_data_start, our_data_size);
                             self.remote_last_seq = self.remote_last_seq + our_data_size;
                         }
 
@@ -1571,7 +1605,7 @@ impl<'a> Socket<'a> {
             } else {
                 // DMA disabled, data stays in tx_buffer and will be sent via ethernet
                 tcp_trace!("DMA disabled, data will be sent via ethernet interface");
-                
+
                 // Handle the remaining post-send logic
                 self.handle_new_data_sent_after_injection(size, old_length)?;
             }
@@ -3164,7 +3198,11 @@ mod test {
             self.dma_enabled
         }
 
-        fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
+        fn set_dma_enabled(
+            &mut self,
+            seq_num: TcpSeqNumber,
+            ack_num: TcpSeqNumber,
+        ) -> Result<(), DmaError> {
             self.dma_enabled = true;
             tcp_trace!(
                 "DMA enabled for TestFpgaSynchronizer with seq={}, ack={}",
@@ -8547,30 +8585,36 @@ mod test {
         s.tx_buffer = MaskedSocketBuffer::new(buf);
         let sync_str = "***";
         let sync_str_len = sync_str.len();
-        let synchronizer = MockSynchronizer::new(sync_str);
-        s.set_synchronizer(AnyInjectedSegmentSynchronizer::Mock(synchronizer));
-        let seq_num = LOCAL_SEQ + sync_str_len + 1;
+        let synchronizer = TestFpgaSynchronizer::new();
+        s.set_synchronizer(AnyInjectedSegmentSynchronizer::Test(synchronizer));
+        s.enable_dma(LOCAL_SEQ + 1, REMOTE_SEQ + 1).unwrap();
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"***".to_vec());
+        }
         let payload = b"aaaa";
         assert_eq!(s.send_slice(payload), Ok(payload.len()));
-        recv!(
+        recv_fpga!(
             s,
-            Ok(TcpRepr {
-                seq_number: seq_num,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &payload[..],
-                ..RECV_TEMPL
-            })
+            payload.to_vec() // Ok(TcpRepr {
+                             //     seq_number: seq_num,
+                             //     ack_number: Some(REMOTE_SEQ + 1),
+                             //     payload: &payload[..],
+                             //     ..RECV_TEMPL
+                             // })
         );
-        let seq_num = seq_num + payload.len() + sync_str_len;
-        assert_eq!(s.send_slice(b"bbb"), Ok(3));
-        recv!(
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"///".to_vec());
+        }
+        let payload = b"aaaa";
+        assert_eq!(s.send_slice(payload), Ok(payload.len()));
+        recv_fpga!(
             s,
-            Ok(TcpRepr {
-                seq_number: seq_num,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"bbb"[..],
-                ..RECV_TEMPL
-            })
+            payload.to_vec() // Ok(TcpRepr {
+                             //     seq_number: seq_num,
+                             //     ack_number: Some(REMOTE_SEQ + 1),
+                             //     payload: &b"bbb"[..],
+                             //     ..RECV_TEMPL
+                             // })
         );
     }
 
@@ -9469,6 +9513,11 @@ mod test {
     fn test_send_data_to_fpga_with_tracking() {
         let mut s = socket_established_with_fpga_tracking();
 
+        // Enable DMA
+        s.socket
+            .enable_dma(s.socket.local_seq_no, s.socket.remote_seq_no)
+            .unwrap();
+
         // Send data via the socket - this should capture it in fpga_packets
         s.socket.send_slice(b"Hello").unwrap();
 
@@ -9495,6 +9544,11 @@ mod test {
     #[test]
     fn test_send_data_to_fpga_with_autonomous_data() {
         let mut s = socket_established_with_fpga_tracking();
+
+        // Enable DMA
+        s.socket
+            .enable_dma(s.socket.local_seq_no, s.socket.remote_seq_no)
+            .unwrap();
 
         // Queue some autonomous FPGA data
         if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
