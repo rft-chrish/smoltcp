@@ -1500,77 +1500,80 @@ impl<'a> Socket<'a> {
         }
 
         let old_length = self.tx_buffer.len();
-
-        // First, let the user closure add data to buffer (but don't send it yet)
         let (size, result) = f(&mut self.tx_buffer);
 
         if size > 0 {
             // Check if DMA is enabled
             if self.segment_synchronizer.is_dma_enabled() {
                 // Get the payload that was just added
-                let payload_start = old_length;
-                let payload_end = old_length + size;
-
-                // Extract the payload to send to FPGA
-                let payload = self.tx_buffer.get_unmasked(payload_start, payload_end);
+                let payload_data = self.tx_buffer.get_allocated(old_length, old_length + size).to_vec();
 
                 // Send payload via DMA and get any autonomously sent data
-                match self.segment_synchronizer.send_data_via_dma(&payload) {
+                match self.segment_synchronizer.send_data_via_dma(&payload_data) {
                     Ok(fpga_sent_data) => {
+                        // We need to reorder: FPGA data should come before our data
+                        // First, mark our data position
+                        let our_data_start = old_length;
+                        let our_data_size = size;
+
                         if let Some(fpga_data) = fpga_sent_data {
                             tcp_trace!("FPGA autonomously sent {} bytes", fpga_data.len());
-
-                            // We need to insert FPGA data before our payload
-                            // First, remove the user data we just added
-                            self.tx_buffer.dequeue_many(size);
-
-                            // Add FPGA-sent data (marked as already sent)
-                            let fpga_size = self.tx_buffer.enqueue_already_sent(&fpga_data);
-                            if fpga_size != fpga_data.len() {
-                                tcp_trace!(
-                                    "WARNING: Could not enqueue all FPGA data: {}/{} bytes",
-                                    fpga_size,
-                                    fpga_data.len()
-                                );
+                            
+                            // We need to insert FPGA data before our data
+                            // Since we can't insert in the middle, we need to:
+                            // 1. Save all data currently in buffer
+                            // 2. Clear buffer
+                            // 3. Re-add in correct order
+                            
+                            let total_size = old_length + size;
+                            let mut all_data = Vec::with_capacity(total_size + fpga_data.len());
+                            
+                            // Save existing data (before our send)
+                            if old_length > 0 {
+                                all_data.extend_from_slice(&self.tx_buffer.get_allocated(0, old_length));
                             }
-
-                            // Re-add user data (also marked as already sent since FPGA sent it)
-                            let user_size = self.tx_buffer.enqueue_already_sent(&payload);
-                            if user_size != payload.len() {
-                                tcp_trace!(
-                                    "WARNING: Could not re-enqueue all user data: {}/{} bytes",
-                                    user_size,
-                                    payload.len()
-                                );
+                            
+                            // Add FPGA data
+                            all_data.extend_from_slice(&fpga_data);
+                            
+                            // Add our data
+                            all_data.extend_from_slice(&payload_data);
+                            
+                            // Clear buffer and re-add everything
+                            self.tx_buffer.dequeue_many(total_size);
+                            let requeued = self.tx_buffer.enqueue_already_sent(&all_data);
+                            
+                            if requeued != all_data.len() {
+                                tcp_trace!("WARNING: Could not re-enqueue all data: {}/{} bytes", 
+                                    requeued, all_data.len());
                             }
-
-                            // Update sequence number for both FPGA and user data
-                            self.remote_last_seq = self.remote_last_seq + fpga_size + user_size;
+                            
+                            // Update sequence number
+                            self.remote_last_seq = self.remote_last_seq + fpga_data.len() + our_data_size;
                         } else {
-                            // No FPGA data, just mark user data as already sent
-                            self.tx_buffer.mark_as_already_sent(payload_start, size);
-                            self.remote_last_seq = self.remote_last_seq + size;
+                            // No FPGA data, just mark our data as already sent
+                            self.tx_buffer.mark_as_already_sent(our_data_start, our_data_size);
+                            self.remote_last_seq = self.remote_last_seq + our_data_size;
+                        }
+
+                        // Reset the retransmission timer since we've sent data via FPGA
+                        if !self.timer.is_retransmit() {
+                            let rto = self.rtte.retransmission_timeout();
+                            self.timer.set_for_retransmit(Instant::ZERO, rto);
                         }
                     }
                     Err(_e) => {
                         // DMA send failed, remove the data we added
                         self.tx_buffer.dequeue_many(size);
-                        return Err(SendError::InvalidState); // Convert to appropriate error
+                        return Err(SendError::InvalidState);
                     }
                 }
             } else {
                 // DMA disabled, data stays in tx_buffer and will be sent via ethernet
                 tcp_trace!("DMA disabled, data will be sent via ethernet interface");
-            }
-
-            // Handle the remaining post-send logic
-            self.handle_new_data_sent_after_injection(size, old_length)?;
-
-            // Reset the retransmission timer only if we actually sent via DMA
-            // When DMA is disabled, the normal dispatch mechanism will handle the timer
-            if self.segment_synchronizer.is_dma_enabled() && !self.timer.is_retransmit() {
-                let rto = self.rtte.retransmission_timeout();
-                self.timer.set_for_retransmit(Instant::ZERO, rto);
+                
+                // Handle the remaining post-send logic
+                self.handle_new_data_sent_after_injection(size, old_length)?;
             }
         }
 
