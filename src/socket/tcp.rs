@@ -16,6 +16,19 @@ use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber,
     TcpTimestampGenerator, TcpTimestampRepr, TCP_HEADER_LEN,
 };
+/// Error type for DMA operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmaError {
+    Illegal,
+}
+
+impl fmt::Display for DmaError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            DmaError::Illegal => write!(f, "illegal DMA operation"),
+        }
+    }
+}
 
 mod congestion;
 
@@ -109,40 +122,81 @@ pub type MaskedTxBuffer<'a> = MaskedSocketBuffer<'a>;
 
 /// Trait for synchronizing with NICs that can autonomously inject TCP segments
 pub trait InjectedSegmentSynchronizer {
-    /// Send payload to FPGA and retrieve any autonomously injected data
+    /// Send payload via DMA and retrieve any autonomously injected data
     /// Returns any data the FPGA sent since last call
-    fn send_data_to_fpga(&mut self, payload: &[u8]) -> Option<Vec<u8>>;
+    /// Returns an error if DMA is disabled
+    fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError>;
+    
+    /// Check if DMA sending is currently enabled
+    fn is_dma_enabled(&self) -> bool;
+    
+    /// Enable DMA and notify FPGA it can send autonomous packets
+    fn set_dma_enabled(&mut self) -> Result<(), DmaError>;
+    
+    /// Disable DMA and retrieve any pending FPGA-sent data
+    fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError>;
 }
 
-/// A synchronizer that never injects any segments
+/// A synchronizer that has no FPGA connection
 #[derive(Debug)]
-pub struct NoOpSynchronizer;
+pub struct NoFpgaSynchronizer;
 
-impl InjectedSegmentSynchronizer for NoOpSynchronizer {
-    fn send_data_to_fpga(&mut self, _payload: &[u8]) -> Option<Vec<u8>> {
-        None // Never injects anything
+impl InjectedSegmentSynchronizer for NoFpgaSynchronizer {
+    fn send_data_via_dma(&mut self, _payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
+        Err(DmaError::Illegal) // No FPGA to send to
+    }
+    
+    fn is_dma_enabled(&self) -> bool {
+        false // Always disabled since there's no FPGA
+    }
+    
+    fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+        Err(DmaError::Illegal) // Cannot enable DMA without FPGA
+    }
+    
+    fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError> {
+        Ok(Vec::new()) // Always succeeds, returns no data
     }
 }
 
-/// A synchronizer that never injects any segments
+/// A mock synchronizer that simulates FPGA behavior
 #[derive(Debug)]
 pub struct MockSynchronizer {
     injection_str: Vec<u8>,
+    dma_enabled: bool,
 }
 
 impl MockSynchronizer {
     pub fn new(inj_str: &str) -> Self {
         Self {
             injection_str: inj_str.into(),
+            dma_enabled: false,
         }
     }
 }
 
 impl InjectedSegmentSynchronizer for MockSynchronizer {
-    fn send_data_to_fpga(&mut self, _payload: &[u8]) -> Option<Vec<u8>> {
+    fn send_data_via_dma(&mut self, _payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
+        if !self.dma_enabled {
+            return Err(DmaError::Illegal);
+        }
         // For proof-of-concept: simulate FPGA behavior
         // In real implementation, would send payload.len() to FPGA
-        Some(self.injection_str.clone())
+        Ok(Some(self.injection_str.clone()))
+    }
+    
+    fn is_dma_enabled(&self) -> bool {
+        self.dma_enabled
+    }
+    
+    fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+        self.dma_enabled = true;
+        Ok(())
+    }
+    
+    fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError> {
+        self.dma_enabled = false;
+        Ok(Vec::new()) // Mock doesn't have pending data
     }
 }
 
@@ -151,23 +205,31 @@ impl InjectedSegmentSynchronizer for MockSynchronizer {
 pub struct LengthMockSynchronizer {
     /// Simulated FPGA buffer of autonomously sent data (as lengths)
     fpga_sent_lengths: Vec<usize>,
+    dma_enabled: bool,
 }
 
 impl LengthMockSynchronizer {
     pub fn new() -> Self {
         Self {
             fpga_sent_lengths: Vec::new(),
+            dma_enabled: false,
         }
     }
 
     /// Simulate FPGA sending data autonomously
     pub fn simulate_fpga_send(&mut self, length: usize) {
-        self.fpga_sent_lengths.push(length);
+        if self.dma_enabled {
+            self.fpga_sent_lengths.push(length);
+        }
     }
 }
 
 impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
-    fn send_data_to_fpga(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
+    fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
+        if !self.dma_enabled {
+            return Err(DmaError::Illegal);
+        }
+        
         // For proof-of-concept: just send the length to FPGA
         let payload_len = payload.len();
         tcp_trace!("Sending {} bytes to FPGA (mock)", payload_len);
@@ -179,18 +241,45 @@ impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
                 // Return mock data ('*' repeated for the total length)
                 let mock_data = vec![b'*'; total_fpga_len];
                 tcp_trace!("FPGA autonomously sent {} bytes (mock)", total_fpga_len);
-                return Some(mock_data);
+                return Ok(Some(mock_data));
             }
         }
 
-        None
+        Ok(None)
+    }
+    
+    fn is_dma_enabled(&self) -> bool {
+        self.dma_enabled
+    }
+    
+    fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+        self.dma_enabled = true;
+        tcp_trace!("DMA enabled for LengthMockSynchronizer");
+        Ok(())
+    }
+    
+    fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError> {
+        self.dma_enabled = false;
+        tcp_trace!("DMA disabled for LengthMockSynchronizer");
+        
+        // Return any pending FPGA data
+        if !self.fpga_sent_lengths.is_empty() {
+            let total_fpga_len: usize = self.fpga_sent_lengths.drain(..).sum();
+            if total_fpga_len > 0 {
+                let mock_data = vec![b'*'; total_fpga_len];
+                tcp_trace!("Returning {} bytes of pending FPGA data", total_fpga_len);
+                return Ok(mock_data);
+            }
+        }
+        
+        Ok(Vec::new())
     }
 }
 
 /// Enum wrapper for different segment synchronizer implementations
 #[derive(Debug)]
 pub enum AnyInjectedSegmentSynchronizer {
-    NoOp(NoOpSynchronizer),
+    NoFpga(NoFpgaSynchronizer),
     Mock(MockSynchronizer),
     LengthMock(LengthMockSynchronizer),
     #[cfg(test)]
@@ -198,21 +287,50 @@ pub enum AnyInjectedSegmentSynchronizer {
 }
 
 impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
-    fn send_data_to_fpga(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
+    fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
         match self {
-            Self::NoOp(sync) => sync.send_data_to_fpga(payload),
-            Self::Mock(sync) => sync.send_data_to_fpga(payload),
-            Self::LengthMock(sync) => sync.send_data_to_fpga(payload),
+            Self::NoFpga(sync) => sync.send_data_via_dma(payload),
+            Self::Mock(sync) => sync.send_data_via_dma(payload),
+            Self::LengthMock(sync) => sync.send_data_via_dma(payload),
             #[cfg(test)]
-            Self::Test(sync) => sync.send_data_to_fpga(payload),
+            Self::Test(sync) => sync.send_data_via_dma(payload),
+        }
+    }
+    
+    fn is_dma_enabled(&self) -> bool {
+        match self {
+            Self::NoFpga(sync) => sync.is_dma_enabled(),
+            Self::Mock(sync) => sync.is_dma_enabled(),
+            Self::LengthMock(sync) => sync.is_dma_enabled(),
+            #[cfg(test)]
+            Self::Test(sync) => sync.is_dma_enabled(),
+        }
+    }
+    
+    fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+        match self {
+            Self::NoFpga(sync) => sync.set_dma_enabled(),
+            Self::Mock(sync) => sync.set_dma_enabled(),
+            Self::LengthMock(sync) => sync.set_dma_enabled(),
+            #[cfg(test)]
+            Self::Test(sync) => sync.set_dma_enabled(),
+        }
+    }
+    
+    fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError> {
+        match self {
+            Self::NoFpga(sync) => sync.set_dma_disabled(),
+            Self::Mock(sync) => sync.set_dma_disabled(),
+            Self::LengthMock(sync) => sync.set_dma_disabled(),
+            #[cfg(test)]
+            Self::Test(sync) => sync.set_dma_disabled(),
         }
     }
 }
 
 impl Default for AnyInjectedSegmentSynchronizer {
     fn default() -> Self {
-        Self::NoOp(NoOpSynchronizer)
-        // Self::Wrong(WrongSynchronizer)
+        Self::NoFpga(NoFpgaSynchronizer)
     }
 }
 
@@ -736,6 +854,22 @@ impl<'a> Socket<'a> {
 
     pub fn set_synchronizer(&mut self, synchronizer: AnyInjectedSegmentSynchronizer) {
         self.segment_synchronizer = synchronizer;
+    }
+
+    /// Enable DMA sending and notify FPGA it can send autonomous packets
+    pub fn enable_dma(&mut self) -> Result<(), DmaError> {
+        self.segment_synchronizer.set_dma_enabled()
+    }
+
+    /// Disable DMA sending and retrieve any pending FPGA-sent data
+    /// Returns any data the FPGA has autonomously sent since last call
+    pub fn disable_dma(&mut self) -> Result<Vec<u8>, DmaError> {
+        self.segment_synchronizer.set_dma_disabled()
+    }
+
+    /// Check if DMA sending is currently enabled
+    pub fn is_dma_enabled(&self) -> bool {
+        self.segment_synchronizer.is_dma_enabled()
     }
 
     /// Enable or disable TCP Timestamp.
@@ -1360,47 +1494,62 @@ impl<'a> Socket<'a> {
         let (size, result) = f(&mut self.tx_buffer);
 
         if size > 0 {
-            // Get the payload that was just added
-            let payload_start = old_length;
-            let payload_end = old_length + size;
+            // Check if DMA is enabled
+            if self.segment_synchronizer.is_dma_enabled() {
+                // Get the payload that was just added
+                let payload_start = old_length;
+                let payload_end = old_length + size;
 
-            // Extract the payload to send to FPGA
-            let payload = self.tx_buffer.get_unmasked(payload_start, payload_end);
+                // Extract the payload to send to FPGA
+                let payload = self.tx_buffer.get_unmasked(payload_start, payload_end);
 
-            // Send payload to FPGA and get any autonomously sent data
-            if let Some(fpga_sent_data) = self.segment_synchronizer.send_data_to_fpga(&payload) {
-                tcp_trace!("FPGA autonomously sent {} bytes", fpga_sent_data.len());
+                // Send payload via DMA and get any autonomously sent data
+                match self.segment_synchronizer.send_data_via_dma(&payload) {
+                    Ok(fpga_sent_data) => {
+                        if let Some(fpga_data) = fpga_sent_data {
+                            tcp_trace!("FPGA autonomously sent {} bytes", fpga_data.len());
 
-                // We need to insert FPGA data before our payload
-                // First, remove the user data we just added
-                self.tx_buffer.dequeue_many(size);
+                            // We need to insert FPGA data before our payload
+                            // First, remove the user data we just added
+                            self.tx_buffer.dequeue_many(size);
 
-                // Add FPGA-sent data (marked as already sent)
-                let fpga_size = self.tx_buffer.enqueue_already_sent(&fpga_sent_data);
-                if fpga_size != fpga_sent_data.len() {
-                    tcp_trace!(
-                        "WARNING: Could not enqueue all FPGA data: {}/{} bytes",
-                        fpga_size,
-                        fpga_sent_data.len()
-                    );
+                            // Add FPGA-sent data (marked as already sent)
+                            let fpga_size = self.tx_buffer.enqueue_already_sent(&fpga_data);
+                            if fpga_size != fpga_data.len() {
+                                tcp_trace!(
+                                    "WARNING: Could not enqueue all FPGA data: {}/{} bytes",
+                                    fpga_size,
+                                    fpga_data.len()
+                                );
+                            }
+
+                            // Re-add user data (also marked as already sent since FPGA sent it)
+                            let user_size = self.tx_buffer.enqueue_already_sent(&payload);
+                            if user_size != payload.len() {
+                                tcp_trace!(
+                                    "WARNING: Could not re-enqueue all user data: {}/{} bytes",
+                                    user_size,
+                                    payload.len()
+                                );
+                            }
+
+                            // Update sequence number for both FPGA and user data
+                            self.remote_last_seq = self.remote_last_seq + fpga_size + user_size;
+                        } else {
+                            // No FPGA data, just mark user data as already sent
+                            self.tx_buffer.mark_as_already_sent(payload_start, size);
+                            self.remote_last_seq = self.remote_last_seq + size;
+                        }
+                    }
+                    Err(_e) => {
+                        // DMA send failed, remove the data we added
+                        self.tx_buffer.dequeue_many(size);
+                        return Err(SendError::InvalidState); // Convert to appropriate error
+                    }
                 }
-
-                // Re-add user data (also marked as already sent since FPGA sent it)
-                let user_size = self.tx_buffer.enqueue_already_sent(&payload);
-                if user_size != payload.len() {
-                    tcp_trace!(
-                        "WARNING: Could not re-enqueue all user data: {}/{} bytes",
-                        user_size,
-                        payload.len()
-                    );
-                }
-
-                // Update sequence number for both FPGA and user data
-                self.remote_last_seq = self.remote_last_seq + fpga_size + user_size;
             } else {
-                // No FPGA data, just mark user data as already sent
-                self.tx_buffer.mark_as_already_sent(payload_start, size);
-                self.remote_last_seq = self.remote_last_seq + size;
+                // DMA disabled, data stays in tx_buffer and will be sent via ethernet
+                tcp_trace!("DMA disabled, data will be sent via ethernet interface");
             }
 
             // Handle the remaining post-send logic
@@ -2560,6 +2709,31 @@ impl<'a> Socket<'a> {
         } else if !self.seq_to_transmit(cx) && self.timer.should_retransmit(cx.now()) {
             // If a retransmit timer expired, we should resend data starting at the last ACK.
             net_debug!("retransmitting");
+            
+            // Disable DMA before retransmission and collect any pending FPGA data
+            if self.segment_synchronizer.is_dma_enabled() {
+                match self.segment_synchronizer.set_dma_disabled() {
+                    Ok(pending_data) => {
+                        if !pending_data.is_empty() {
+                            tcp_trace!("Retrieved {} bytes of pending FPGA data before retransmission", pending_data.len());
+                            // Add pending data to tx_buffer as already sent
+                            let fpga_size = self.tx_buffer.enqueue_already_sent(&pending_data);
+                            if fpga_size != pending_data.len() {
+                                tcp_trace!(
+                                    "WARNING: Could not enqueue all pending FPGA data: {}/{} bytes",
+                                    fpga_size,
+                                    pending_data.len()
+                                );
+                            }
+                            // Update sequence number for the FPGA data
+                            self.remote_last_seq = self.remote_last_seq + fpga_size;
+                        }
+                    }
+                    Err(e) => {
+                        net_debug!("Failed to disable DMA for retransmission: {:?}", e);
+                    }
+                }
+            }
 
             // Rewind "last sequence number sent", as if we never
             // had sent them. This will cause all data in the queue
@@ -2927,6 +3101,7 @@ mod test {
     pub struct TestFpgaSynchronizer {
         fpga_packets: Vec<Vec<u8>>,
         autonomous_data: Vec<Vec<u8>>,
+        dma_enabled: bool,
     }
 
     impl TestFpgaSynchronizer {
@@ -2934,12 +3109,15 @@ mod test {
             Self {
                 fpga_packets: Vec::new(),
                 autonomous_data: Vec::new(),
+                dma_enabled: false,
             }
         }
 
         /// Queue data that FPGA will autonomously send
         pub fn queue_autonomous_data(&mut self, data: Vec<u8>) {
-            self.autonomous_data.push(data);
+            if self.dma_enabled {
+                self.autonomous_data.push(data);
+            }
         }
 
         /// Get the packets that were sent to FPGA
@@ -2949,16 +3127,39 @@ mod test {
     }
 
     impl InjectedSegmentSynchronizer for TestFpgaSynchronizer {
-        fn send_data_to_fpga(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
+        fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
+            if !self.dma_enabled {
+                return Err(DmaError::Illegal);
+            }
+            
             // Capture the packet sent to FPGA
             self.fpga_packets.push(payload.to_vec());
 
             // Return any queued autonomous data
             if !self.autonomous_data.is_empty() {
-                Some(self.autonomous_data.remove(0))
+                Ok(Some(self.autonomous_data.remove(0)))
             } else {
-                None
+                Ok(None)
             }
+        }
+        
+        fn is_dma_enabled(&self) -> bool {
+            self.dma_enabled
+        }
+        
+        fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+            self.dma_enabled = true;
+            Ok(())
+        }
+        
+        fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError> {
+            self.dma_enabled = false;
+            // Return all pending autonomous data concatenated
+            let mut result = Vec::new();
+            for data in self.autonomous_data.drain(..) {
+                result.extend(data);
+            }
+            Ok(result)
         }
     }
 
