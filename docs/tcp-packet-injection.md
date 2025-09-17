@@ -11,6 +11,12 @@ This injection behaviour creates some complications:
 - Both sequence and ack numbers need to be co-ordinated between FPGA and host. This is made more complex because the FPGA needs to send packets immediately (ie, without first communicating with the host).
 - The buffer of transmitted messages (needed for, eg, retransmission) is stored in `smoltcp`'s memory on the host. Messages sent autonomously by the FPGA need to be added to that buffer, both to maintain correct sequence numbers, and because the FPGA cannot do retransmission itself.
 
+## DMA Toggle Functionality
+A key addition to the design is the ability to enable/disable DMA sending on a per-socket basis:
+- **DMA Enabled**: Data is sent via the FPGA using DMA, and the FPGA is allowed to send autonomous packets
+- **DMA Disabled**: Data is sent via the normal ethernet interface, and the FPGA is prohibited from sending autonomous packets
+- This toggle is essential during TCP connection handshaking, finishing, and retransmission scenarios where smoltcp needs direct control
+
 ## Smoltcp's architecture
 - `smoltcp` keeps a `tx_buffer`, which is a ring buffer of pure payload data. This buffer contains both data that needs to be sent, and data that has already been sent (but not yet acked).
 - At any time, `tx_buffer[0]` is the last un-acked byte sent. The variable `local_seq_no` stores which actual sequence number this byte is (and from this, the sequence numbers of all the other bytes in the ring buffer can be established).
@@ -31,28 +37,94 @@ This injection behaviour creates some complications:
 - This achieves all the desired goals of being latency-efficient, not getting any packets out of order, and getting the sequence and ack numbers right.
 - Although sending of TCP data will not use the ethernet iface (and instead directly send the payloads via DMA), any sub-TCP traffic that `smoltcp` might use will still be sent via the ethernet iface.
 
-## Changes that need to be made to `smoltcp`
-- `tx_buffer` needs to be made into a masked ring buffer.
-- We need to call `send_payload_to_fpga` from within `send_impl`. `send_impl` is the function that all other send functions ultimately call, so this means all TCP sending will be done via `send_payload_to_fpga`.
-- When `send_payload_to_fpga` is called in this way, we need to also reset the retransmission timer.
-- We will need another function `allow_fpga_sending(enable: Bool)` which tells the FPGA whether it is allowed to autonomously send. Autonomous sending needs to be temporarily disabled when retransmission is being done.
-- `smoltcp` needs to be adjusted so that data that has been marked as "already transmitted" in the masked ring buffer, does not get transmitted via the normal transmission mechanisms in smoltcp's event loop.
+## Implementation in `smoltcp`
 
-## Some example scenarios:
-### FPGA sends, then smoltcp sends
-- FPGA sends packet A.
-- smoltcp wants to send packet B. It sends packet B to FPGA to send via `send_payload_to_fpga`, and simultaneously learns about packet A.
-- It adds packet A (with send_mask = False) and then packet B (with send_mask = False) to `tx_buffer`.
-- `smoltcp` itself sends nothing via the ethernet interface (as all sending was done via the FPGA).
-### FPGA sends, then smoltcp sends twice
-- FPGA sends packet A.
-- smoltcp wants to send packet B. It sends packet B to FPGA to send via `send_payload_to_fpga`, and simultaneously learns about packet A.
-- It adds packet A (with send_mask = False) and then packet B (with send_mask = False) to `tx_buffer`. Nothing is sent via the ethernet interface. This blocks until complete.
-- It then sends packet C. Again it runs `send_payload_to_fpga`. The FPGA has not sent any new packets in the interim, so no new packets are returned from this. Packet C is added to the `tx_buffer`, which now (correctly) has `packet A ++ packet B ++ packet C`.
+### Core Components
+- **`MaskedSocketBuffer`**: Enhanced `tx_buffer` that tracks which data should be transmitted vs. already sent
+- **`InjectedSegmentSynchronizer` trait**: Defines the interface for FPGA communication with DMA control
+- **`DmaError`**: Error type for DMA-specific operations
+- **Multiple synchronizer implementations**: `NoFpgaSynchronizer`, `LengthMockSynchronizer`, `TestFpgaSynchronizer`
 
-## What a proof-of-concept of this would look like:
-- The same as above, but instead of sending an actual payload to the FPGA via the `send_payload_to_fpga` function, we would send just the length of the intended payload. The FPGA would then mock a payload from this (ie, make the payload the * character for the appropriate length)
-- Similarly, the return value from the function would be the length, not the contents, of any data that the FPGA autonomously sent.
-- This preserves much of the same architecture whilst requiring simplified DMA capabilities.
-- The function's signature would remain the same.
+### InjectedSegmentSynchronizer API
+```rust
+pub trait InjectedSegmentSynchronizer {
+    /// Send payload via DMA and retrieve any autonomously sent data
+    /// Returns an error if DMA is disabled
+    fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError>;
+    
+    /// Check if DMA sending is currently enabled
+    fn is_dma_enabled(&self) -> bool;
+    
+    /// Enable DMA and notify FPGA it can send autonomous packets
+    /// Takes current sequence and ack numbers to sync FPGA with TCP state
+    fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError>;
+    
+    /// Disable DMA and retrieve any pending FPGA-sent data
+    fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError>;
+}
+```
+
+### Public Socket API
+```rust
+impl TcpSocket {
+    /// Enable DMA sending with current TCP sequence/ack state
+    pub fn enable_dma(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError>;
+    
+    /// Disable DMA and retrieve any pending FPGA data
+    pub fn disable_dma(&mut self) -> Result<Vec<u8>, DmaError>;
+    
+    /// Check current DMA status
+    pub fn is_dma_enabled(&self) -> bool;
+}
+```
+
+### Sending Logic Changes
+- **`send_impl`** modified to check DMA status before sending
+- **DMA Enabled Path**: Data sent via `send_data_via_dma()`, FPGA autonomous data inserted first, both marked as "already sent"
+- **DMA Disabled Path**: Data sent via normal ethernet interface using existing smoltcp mechanisms
+- **Automatic DMA Disable**: During retransmission, DMA is automatically disabled and any pending FPGA data is retrieved
+
+### Error Handling
+- **Safe API**: `send_data_via_dma()` returns error if called when DMA disabled
+- **State Management**: FPGA is notified when it can/cannot send autonomous packets
+- **Data Recovery**: When disabling DMA, any pending FPGA-sent data is retrieved and added to tx_buffer
+
+## Implementation Scenarios
+
+### DMA Enabled: FPGA sends, then smoltcp sends
+1. FPGA autonomously sends packet A
+2. smoltcp wants to send packet B
+3. smoltcp calls `send_data_via_dma(B)` and learns about packet A
+4. smoltcp adds packet A (marked as already sent) then packet B (marked as already sent) to `tx_buffer`
+5. No packets sent via ethernet interface (all handled by FPGA)
+
+### DMA Disabled: Normal ethernet sending
+1. smoltcp wants to send packet B
+2. DMA is disabled, so packet B is added to `tx_buffer` for normal transmission
+3. smoltcp's normal dispatch mechanism sends packet B via ethernet interface
+4. FPGA cannot send autonomous packets while DMA is disabled
+
+### DMA Toggle During Retransmission
+1. TCP timeout occurs, triggering retransmission
+2. smoltcp automatically disables DMA via `set_dma_disabled()`
+3. Any pending FPGA data is retrieved and added to tx_buffer
+4. smoltcp handles retransmission via normal ethernet interface
+5. DMA can be re-enabled after retransmission is complete
+
+### Connection Lifecycle
+- **Handshaking**: DMA disabled, smoltcp handles SYN/ACK via ethernet
+- **Established**: DMA enabled with `enable_dma(seq_num, ack_num)` for low-latency data
+- **Closing**: DMA disabled, smoltcp handles FIN/ACK via ethernet
+
+## Testing Infrastructure
+- **`TestFpgaSynchronizer`**: Captures packets sent to FPGA and simulates autonomous data
+- **`LengthMockSynchronizer`**: Proof-of-concept using lengths instead of actual data
+- **`NoFpgaSynchronizer`**: For systems without FPGA (always returns DMA errors)
+
+## Key Design Decisions
+- **Per-socket DMA control**: Each TCP socket has independent DMA state
+- **Explicit enable/disable**: DMA must be explicitly enabled with sequence numbers
+- **Safe API**: Operations that require DMA return errors when disabled
+- **Data ordering**: FPGA autonomous data always inserted before user data in buffer
+- **Retransmission safety**: DMA automatically disabled during retransmission
 
