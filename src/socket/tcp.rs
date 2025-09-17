@@ -132,7 +132,7 @@ pub trait InjectedSegmentSynchronizer {
 
     /// Enable DMA and notify FPGA it can send autonomous packets
     /// Takes sequence_number and ack_number to sync FPGA with current TCP state
-    fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError>;
+    fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError>;
 
     /// Disable DMA and retrieve any pending FPGA-sent data
     fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError>;
@@ -151,7 +151,7 @@ impl InjectedSegmentSynchronizer for NoFpgaSynchronizer {
         false // Always disabled since there's no FPGA
     }
 
-    fn set_dma_enabled(&mut self, _seq_num: usize, _ack_num: usize) -> Result<(), DmaError> {
+    fn set_dma_enabled(&mut self, _seq_num: TcpSeqNumber, _ack_num: TcpSeqNumber) -> Result<(), DmaError> {
         Err(DmaError::Illegal) // Cannot enable DMA without FPGA
     }
 
@@ -190,7 +190,7 @@ impl InjectedSegmentSynchronizer for MockSynchronizer {
         self.dma_enabled
     }
 
-    fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
+    fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
         self.dma_enabled = true;
         tcp_trace!(
             "DMA enabled for MockSynchronizer with seq={}, ack={}",
@@ -258,7 +258,7 @@ impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
         self.dma_enabled
     }
 
-    fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
+    fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
         self.dma_enabled = true;
         tcp_trace!(
             "DMA enabled for LengthMockSynchronizer with seq={}, ack={}",
@@ -317,7 +317,7 @@ impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
         }
     }
 
-    fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
+    fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
         match self {
             Self::NoFpga(sync) => sync.set_dma_enabled(seq_num, ack_num),
             Self::Mock(sync) => sync.set_dma_enabled(seq_num, ack_num),
@@ -868,7 +868,7 @@ impl<'a> Socket<'a> {
 
     /// Enable DMA sending and notify FPGA it can send autonomous packets
     /// Takes current sequence and ack numbers to sync FPGA with TCP state
-    pub fn enable_dma(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
+    pub fn enable_dma(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
         self.segment_synchronizer.set_dma_enabled(seq_num, ack_num)
     }
 
@@ -3161,7 +3161,7 @@ mod test {
             self.dma_enabled
         }
 
-        fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
+        fn set_dma_enabled(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
             self.dma_enabled = true;
             tcp_trace!(
                 "DMA enabled for TestFpgaSynchronizer with seq={}, ack={}",
@@ -3376,15 +3376,15 @@ mod test {
 
         let mut fail = false;
         let mut packet_info = None;
-        let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, (ip_repr, tcp_repr)| {
-            fail = true;
-            // Format the packet information inside the closure
-            packet_info = Some(format!(
-                "IP: {:?}\nTCP: {:?}",
-                ip_repr, tcp_repr
-            ));
-            Ok(())
-        });
+        let result: Result<(), ()> =
+            socket
+                .socket
+                .dispatch(&mut socket.cx, |_, (ip_repr, tcp_repr)| {
+                    fail = true;
+                    // Format the packet information inside the closure
+                    packet_info = Some(format!("IP: {:?}\nTCP: {:?}", ip_repr, tcp_repr));
+                    Ok(())
+                });
         if fail {
             if let Some(info) = packet_info {
                 panic!("Should not send a packet, but got:\n{}", info);
@@ -8528,6 +8528,7 @@ mod test {
         s.tx_buffer = MaskedSocketBuffer::new(buf);
         let synchronizer = MockSynchronizer::new("*");
         s.set_synchronizer(AnyInjectedSegmentSynchronizer::Mock(synchronizer));
+        s.enable_dma(LOCAL_SEQ + 1, REMOTE_SEQ + 1).unwrap();
         assert_eq!(s.send_slice(b"a"), Ok(1));
         assert_eq!(s.send_slice(b"b"), Ok(1));
         assert_eq!(s.send_slice(b"c"), Ok(1));
