@@ -306,18 +306,43 @@ impl<'a> MaskedSocketBuffer<'a> {
     /// Get a slice of data from the buffer (ignoring mask) as a Vec.
     /// 
     /// This is useful when you need the actual data regardless of mask state.
+    /// Handles ring buffer wrap-around by collecting data from multiple contiguous segments.
     pub fn get_unmasked(&self, offset: usize, end: usize) -> Vec<u8> {
         let size = end - offset;
-        self.buffer.get_allocated(offset, size).to_vec()
+        if size == 0 {
+            return Vec::new();
+        }
+        
+        // Get the first contiguous segment
+        let first_segment = self.buffer.get_allocated(offset, size);
+        let first_len = first_segment.len();
+        
+        // If we got all the data in the first segment, we're done
+        if first_len == size {
+            return first_segment.to_vec();
+        }
+        
+        // Otherwise, we need to handle wrap-around
+        let mut result = Vec::with_capacity(size);
+        result.extend_from_slice(first_segment);
+        
+        // Calculate how much more data we need from the wrapped portion
+        let remaining = size - first_len;
+        let second_offset = offset + first_len;
+        let second_segment = self.buffer.get_allocated(second_offset, remaining);
+        result.extend_from_slice(second_segment);
+        
+        result
     }
     
     /// Mark a range of already-enqueued data as "already sent".
     /// 
     /// This is used when data in the buffer has been sent externally (e.g., by FPGA).
+    /// The offset and size are logical positions in the buffer.
     pub fn mark_as_already_sent(&mut self, offset: usize, size: usize) {
         let range_end = offset + size;
         for i in offset..range_end {
-            if i < self.mask.len() {
+            if i < self.buffer.len() {
                 self.mask[i] = false;
             }
         }
@@ -540,5 +565,32 @@ mod tests {
         assert!(debug_str.contains("'3'"));
         assert!(debug_str.contains("'4'"));
         assert!(debug_str.contains("'5'"));
+    }
+
+    #[test]
+    fn test_get_unmasked_wraparound() {
+        let mut buffer = MaskedSocketBuffer::new(RingBuffer::new(vec![0u8; 8]));
+        
+        // Fill buffer to near capacity
+        buffer.enqueue_slice(b"abcdef"); // 6 bytes
+        
+        // Dequeue some to create space at beginning and force wraparound
+        let _ = buffer.dequeue_many(4); // Remove "abcd", leaves "ef" at positions 0-1
+        
+        // Add more data that will wrap around
+        buffer.enqueue_slice(b"ghijk"); // 5 bytes, will wrap around
+        
+        // Buffer now has "ef" followed by "ghijk" that wraps around
+        // Verify we can get all the data correctly
+        let all_data = buffer.get_unmasked(0, buffer.len());
+        assert_eq!(all_data, b"efghijk");
+        
+        // Test getting partial data that crosses wrap boundary
+        let partial = buffer.get_unmasked(1, 5); // Should get "fghi"
+        assert_eq!(partial, b"fghi");
+        
+        // Test getting data from end that wraps
+        let end_data = buffer.get_unmasked(2, 7); // Should get "ghijk"
+        assert_eq!(end_data, b"ghijk");
     }
 }

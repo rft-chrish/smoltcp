@@ -159,7 +159,7 @@ impl LengthMockSynchronizer {
             fpga_sent_lengths: Vec::new(),
         }
     }
-    
+
     /// Simulate FPGA sending data autonomously
     pub fn simulate_fpga_send(&mut self, length: usize) {
         self.fpga_sent_lengths.push(length);
@@ -171,7 +171,7 @@ impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
         // For proof-of-concept: just send the length to FPGA
         let payload_len = payload.len();
         tcp_trace!("Sending {} bytes to FPGA (mock)", payload_len);
-        
+
         // Check if FPGA has sent anything autonomously
         if !self.fpga_sent_lengths.is_empty() {
             let total_fpga_len: usize = self.fpga_sent_lengths.drain(..).sum();
@@ -182,7 +182,7 @@ impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
                 return Some(mock_data);
             }
         }
-        
+
         None
     }
 }
@@ -1346,7 +1346,6 @@ impl<'a> Socket<'a> {
         !self.rx_buffer.is_empty()
     }
 
-    /// CH function potentially adds to buffer
     fn send_impl<F, R>(&mut self, f: F) -> Result<R, SendError>
     where
         F: FnOnce(&mut MaskedTxBuffer<'a>) -> (usize, R),
@@ -1364,18 +1363,18 @@ impl<'a> Socket<'a> {
             // Get the payload that was just added
             let payload_start = old_length;
             let payload_end = old_length + size;
-            
+
             // Extract the payload to send to FPGA
             let payload = self.tx_buffer.get_unmasked(payload_start, payload_end);
-            
+
             // Send payload to FPGA and get any autonomously sent data
             if let Some(fpga_sent_data) = self.segment_synchronizer.send_data_to_fpga(&payload) {
                 tcp_trace!("FPGA autonomously sent {} bytes", fpga_sent_data.len());
-                
+
                 // We need to insert FPGA data before our payload
                 // First, remove the user data we just added
                 self.tx_buffer.dequeue_many(size);
-                
+
                 // Add FPGA-sent data (marked as already sent)
                 let fpga_size = self.tx_buffer.enqueue_already_sent(&fpga_sent_data);
                 if fpga_size != fpga_sent_data.len() {
@@ -1385,7 +1384,7 @@ impl<'a> Socket<'a> {
                         fpga_sent_data.len()
                     );
                 }
-                
+
                 // Re-add user data (also marked as already sent since FPGA sent it)
                 let user_size = self.tx_buffer.enqueue_already_sent(&payload);
                 if user_size != payload.len() {
@@ -1395,7 +1394,7 @@ impl<'a> Socket<'a> {
                         payload.len()
                     );
                 }
-                
+
                 // Update sequence number for both FPGA and user data
                 self.remote_last_seq = self.remote_last_seq + fpga_size + user_size;
             } else {
@@ -1403,10 +1402,10 @@ impl<'a> Socket<'a> {
                 self.tx_buffer.mark_as_already_sent(payload_start, size);
                 self.remote_last_seq = self.remote_last_seq + size;
             }
-            
+
             // Handle the remaining post-send logic
             self.handle_new_data_sent_after_injection(size, old_length)?;
-            
+
             // Reset the retransmission timer since we've sent data via FPGA
             // This is similar to what happens in dispatch() after normal sending
             if !self.timer.is_retransmit() {
@@ -2918,9 +2917,6 @@ mod test {
     use crate::wire::IpRepr;
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
-    use std::collections::VecDeque;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     // =========================================================================================//
     // Test Infrastructure for FPGA packet tracking
@@ -2929,29 +2925,34 @@ mod test {
     /// Test synchronizer that captures packets sent to FPGA for verification
     #[derive(Debug)]
     pub struct TestFpgaSynchronizer {
-        fpga_packets: Rc<RefCell<VecDeque<Vec<u8>>>>,
+        fpga_packets: Vec<Vec<u8>>,
         autonomous_data: Vec<Vec<u8>>,
     }
 
     impl TestFpgaSynchronizer {
-        pub fn new(fpga_packets: Rc<RefCell<VecDeque<Vec<u8>>>>) -> Self {
+        pub fn new() -> Self {
             Self {
-                fpga_packets,
+                fpga_packets: Vec::new(),
                 autonomous_data: Vec::new(),
             }
         }
-        
+
         /// Queue data that FPGA will autonomously send
         pub fn queue_autonomous_data(&mut self, data: Vec<u8>) {
             self.autonomous_data.push(data);
+        }
+
+        /// Get the packets that were sent to FPGA
+        pub fn get_fpga_packets(&self) -> &Vec<Vec<u8>> {
+            &self.fpga_packets
         }
     }
 
     impl InjectedSegmentSynchronizer for TestFpgaSynchronizer {
         fn send_data_to_fpga(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
             // Capture the packet sent to FPGA
-            self.fpga_packets.borrow_mut().push_back(payload.to_vec());
-            
+            self.fpga_packets.push(payload.to_vec());
+
             // Return any queued autonomous data
             if !self.autonomous_data.is_empty() {
                 Some(self.autonomous_data.remove(0))
@@ -3082,6 +3083,16 @@ mod test {
     impl DerefMut for TestSocket {
         fn deref_mut(&mut self) -> &mut Self::Target {
             &mut self.socket
+        }
+    }
+
+    impl TestSocket {
+        /// Get a mutable reference to the FPGA packets if using TestFpgaSynchronizer
+        fn get_fpga_packets_mut(&mut self) -> Option<&mut Vec<Vec<u8>>> {
+            match &mut self.socket.segment_synchronizer {
+                AnyInjectedSegmentSynchronizer::Test(ref mut sync) => Some(&mut sync.fpga_packets),
+                _ => None,
+            }
         }
     }
 
@@ -3222,20 +3233,31 @@ mod test {
 
     #[collapse_debuginfo(yes)]
     macro_rules! recv_fpga {
-        ($fpga_packets:expr, $expected_payload:expr) => ({
-            let mut packets = $fpga_packets.borrow_mut();
-            assert!(!packets.is_empty(), "Expected FPGA packet but none found");
-            let payload = packets.pop_front().unwrap();
+        ($socket:expr, $expected_payload:expr) => {{
+            let fpga_packets = $socket
+                .get_fpga_packets_mut()
+                .expect("Socket does not have TestFpgaSynchronizer");
+            assert!(
+                !fpga_packets.is_empty(),
+                "Expected FPGA packet but none found"
+            );
+            let payload = fpga_packets.remove(0);
+            print!("PAYLOAD: {:?}", payload);
             assert_eq!(payload, $expected_payload, "FPGA packet payload mismatch");
-        });
+        }};
     }
 
     #[collapse_debuginfo(yes)]
     macro_rules! recv_fpga_nothing {
-        ($fpga_packets:expr) => ({
-            let packets = $fpga_packets.borrow();
-            assert!(packets.is_empty(), "Expected no FPGA packets but found some");
-        });
+        ($socket:expr) => {{
+            let fpga_packets = $socket
+                .get_fpga_packets_mut()
+                .expect("Socket does not have TestFpgaSynchronizer");
+            assert!(
+                fpga_packets.is_empty(),
+                "Expected no FPGA packets but found some"
+            );
+        }};
     }
 
     #[collapse_debuginfo(yes)]
@@ -3272,29 +3294,26 @@ mod test {
     }
 
     /// Create a socket with FPGA packet tracking enabled
-    fn socket_with_fpga_tracking() -> (TestSocket, Rc<RefCell<VecDeque<Vec<u8>>>>) {
+    fn socket_with_fpga_tracking() -> TestSocket {
         socket_with_fpga_tracking_and_buffer_sizes(64, 64)
     }
 
     /// Create a socket with FPGA packet tracking and custom buffer sizes
-    fn socket_with_fpga_tracking_and_buffer_sizes(tx_len: usize, rx_len: usize) -> (TestSocket, Rc<RefCell<VecDeque<Vec<u8>>>>) {
+    fn socket_with_fpga_tracking_and_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
         let (iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
 
         let rx_buffer = SocketBuffer::new(vec![0; rx_len]);
         let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
         let mut socket = Socket::new(rx_buffer, tx_buffer);
         socket.set_ack_delay(None);
-        
-        let fpga_packets = Rc::new(RefCell::new(VecDeque::new()));
-        let test_sync = TestFpgaSynchronizer::new(fpga_packets.clone());
+
+        let test_sync = TestFpgaSynchronizer::new();
         socket.segment_synchronizer = AnyInjectedSegmentSynchronizer::Test(test_sync);
-        
-        let test_socket = TestSocket {
+
+        TestSocket {
             socket,
             cx: iface.inner,
-        };
-        
-        (test_socket, fpga_packets)
+        }
     }
 
     fn socket_syn_received_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
@@ -3337,6 +3356,20 @@ mod test {
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
+    }
+
+    /// Create an established socket with FPGA packet tracking enabled
+    fn socket_established_with_fpga_tracking() -> TestSocket {
+        let mut s = socket_with_fpga_tracking();
+        s.state = State::Established;
+        s.tuple = Some(TUPLE);
+        s.local_seq_no = LOCAL_SEQ + 1;
+        s.remote_seq_no = REMOTE_SEQ + 1;
+        s.remote_last_seq = LOCAL_SEQ + 1;
+        s.remote_last_ack = Some(REMOTE_SEQ + 1);
+        s.remote_last_win = s.scaled_window();
+        s.remote_win_len = 256;
+        s
     }
 
     fn socket_fin_wait_1() -> TestSocket {
@@ -8309,7 +8342,7 @@ mod test {
 
     #[test]
     fn test_buffer_wraparound_tx() {
-        let mut s = socket_established();
+        let mut s = socket_established_with_fpga_tracking();
         s.set_nagle_enabled(false);
 
         let buf = SocketBuffer::new(vec![b'.'; 9]);
@@ -8321,24 +8354,9 @@ mod test {
 
         // "abcdef" not contiguous in tx buffer
         assert_eq!(s.send_slice(b"abcdef"), Ok(6));
-        recv!(
-            s,
-            Ok(TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"yyyabc"[..],
-                ..RECV_TEMPL
-            })
-        );
-        recv!(
-            s,
-            Ok(TcpRepr {
-                seq_number: LOCAL_SEQ + 1 + 6,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"def"[..],
-                ..RECV_TEMPL
-            })
-        );
+        recv_fpga!(s, b"xxxyyy".to_vec());
+        recv_fpga!(s, b"abcdef".to_vec());
+        recv_nothing!(s);
     }
 
     // =========================================================================================//
@@ -9179,83 +9197,72 @@ mod test {
             }]
         );
     }
-    
+
     #[test]
     fn test_send_data_to_fpga_with_tracking() {
-        let (mut s, fpga_packets) = socket_with_fpga_tracking();
-        
-        // Set up socket as established
-        s.state = State::Established;
-        s.tuple = Some(TUPLE);
-        s.local_seq_no = LOCAL_SEQ + 1;
-        s.remote_seq_no = REMOTE_SEQ + 1;
-        s.remote_last_seq = LOCAL_SEQ + 1;
-        s.remote_last_ack = Some(REMOTE_SEQ + 1);
-        s.remote_last_win = s.scaled_window();
-        s.remote_win_len = 256;
-        
+        let mut s = socket_established_with_fpga_tracking();
+
         // Send data via the socket - this should capture it in fpga_packets
         s.socket.send_slice(b"Hello").unwrap();
-        
+
         // Verify the packet was sent to FPGA
-        recv_fpga!(fpga_packets, b"Hello".to_vec());
-        
-        // Verify no more FPGA packets
-        recv_fpga_nothing!(fpga_packets);
-        
+        if let AnyInjectedSegmentSynchronizer::Test(ref sync) = s.socket.segment_synchronizer {
+            let packets = sync.get_fpga_packets();
+            assert_eq!(packets.len(), 1);
+            assert_eq!(packets[0], b"Hello");
+        } else {
+            panic!("Expected Test synchronizer");
+        }
+
         // Check that data is in the tx_buffer and marked as already sent
         assert_eq!(s.socket.tx_buffer.len(), 5);
         assert_eq!(s.socket.remote_last_seq, s.socket.local_seq_no + 5);
-        
+
         // Data should be marked as already sent (mask = false)
         assert!(!s.socket.tx_buffer.is_range_fully_transmittable(0, 5));
-        
+
         // Verify no packet is sent via interface since it went via FPGA
-        recv_iface!(s, []);
+        recv!(s, []);
     }
-    
+
     #[test]
     fn test_send_data_to_fpga_with_autonomous_data() {
-        let (mut s, fpga_packets) = socket_with_fpga_tracking();
-        
-        // Set up socket as established
-        s.state = State::Established;
-        s.tuple = Some(TUPLE);
-        s.local_seq_no = LOCAL_SEQ + 1;
-        s.remote_seq_no = REMOTE_SEQ + 1;
-        s.remote_last_seq = LOCAL_SEQ + 1;
-        s.remote_last_ack = Some(REMOTE_SEQ + 1);
-        s.remote_last_win = s.scaled_window();
-        s.remote_win_len = 256;
-        
+        let mut s = socket_established_with_fpga_tracking();
+
         // Queue some autonomous FPGA data
         if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
             sync.queue_autonomous_data(b"FPGA".to_vec());
         }
-        
+
         // Send data via the socket - this should capture user data in fpga_packets
         // and return the autonomous data
         s.socket.send_slice(b"Host").unwrap();
-        
+
         // Verify the user packet was sent to FPGA
-        recv_fpga!(fpga_packets, b"Host".to_vec());
-        
+        if let AnyInjectedSegmentSynchronizer::Test(ref sync) = s.socket.segment_synchronizer {
+            let packets = sync.get_fpga_packets();
+            assert_eq!(packets.len(), 1);
+            assert_eq!(packets[0], b"Host");
+        } else {
+            panic!("Expected Test synchronizer");
+        }
+
         // Check that both FPGA autonomous data and user data are in tx_buffer
         // FPGA data should come first, then user data
         assert_eq!(s.socket.tx_buffer.len(), 8); // 4 FPGA bytes + 4 user bytes
-        
+
         let buffer_data = s.socket.tx_buffer.get_allocated(0, 8);
         assert_eq!(&buffer_data[0..4], b"FPGA"); // Autonomous FPGA data first
         assert_eq!(&buffer_data[4..8], b"Host"); // User data second
-        
+
         // Both should be marked as already sent
         assert!(!s.socket.tx_buffer.is_range_fully_transmittable(0, 4)); // FPGA data
         assert!(!s.socket.tx_buffer.is_range_fully_transmittable(4, 4)); // User data
-        
+
         // Sequence number should reflect both
         assert_eq!(s.socket.remote_last_seq, s.socket.local_seq_no + 8);
-        
+
         // Verify no packet is sent via interface since both went via FPGA
-        recv_iface!(s, []);
+        recv!(s, []);
     }
 }
