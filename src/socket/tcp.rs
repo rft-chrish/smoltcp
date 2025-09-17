@@ -131,7 +131,8 @@ pub trait InjectedSegmentSynchronizer {
     fn is_dma_enabled(&self) -> bool;
     
     /// Enable DMA and notify FPGA it can send autonomous packets
-    fn set_dma_enabled(&mut self) -> Result<(), DmaError>;
+    /// Takes sequence_number and ack_number to sync FPGA with current TCP state
+    fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError>;
     
     /// Disable DMA and retrieve any pending FPGA-sent data
     fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError>;
@@ -150,7 +151,7 @@ impl InjectedSegmentSynchronizer for NoFpgaSynchronizer {
         false // Always disabled since there's no FPGA
     }
     
-    fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+    fn set_dma_enabled(&mut self, _seq_num: usize, _ack_num: usize) -> Result<(), DmaError> {
         Err(DmaError::Illegal) // Cannot enable DMA without FPGA
     }
     
@@ -189,8 +190,9 @@ impl InjectedSegmentSynchronizer for MockSynchronizer {
         self.dma_enabled
     }
     
-    fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+    fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
         self.dma_enabled = true;
+        tcp_trace!("DMA enabled for MockSynchronizer with seq={}, ack={}", seq_num, ack_num);
         Ok(())
     }
     
@@ -252,9 +254,9 @@ impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
         self.dma_enabled
     }
     
-    fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+    fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
         self.dma_enabled = true;
-        tcp_trace!("DMA enabled for LengthMockSynchronizer");
+        tcp_trace!("DMA enabled for LengthMockSynchronizer with seq={}, ack={}", seq_num, ack_num);
         Ok(())
     }
     
@@ -307,13 +309,13 @@ impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
         }
     }
     
-    fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+    fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
         match self {
-            Self::NoFpga(sync) => sync.set_dma_enabled(),
-            Self::Mock(sync) => sync.set_dma_enabled(),
-            Self::LengthMock(sync) => sync.set_dma_enabled(),
+            Self::NoFpga(sync) => sync.set_dma_enabled(seq_num, ack_num),
+            Self::Mock(sync) => sync.set_dma_enabled(seq_num, ack_num),
+            Self::LengthMock(sync) => sync.set_dma_enabled(seq_num, ack_num),
             #[cfg(test)]
-            Self::Test(sync) => sync.set_dma_enabled(),
+            Self::Test(sync) => sync.set_dma_enabled(seq_num, ack_num),
         }
     }
     
@@ -857,8 +859,9 @@ impl<'a> Socket<'a> {
     }
 
     /// Enable DMA sending and notify FPGA it can send autonomous packets
-    pub fn enable_dma(&mut self) -> Result<(), DmaError> {
-        self.segment_synchronizer.set_dma_enabled()
+    /// Takes current sequence and ack numbers to sync FPGA with TCP state
+    pub fn enable_dma(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
+        self.segment_synchronizer.set_dma_enabled(seq_num, ack_num)
     }
 
     /// Disable DMA sending and retrieve any pending FPGA-sent data
@@ -3147,8 +3150,9 @@ mod test {
             self.dma_enabled
         }
         
-        fn set_dma_enabled(&mut self) -> Result<(), DmaError> {
+        fn set_dma_enabled(&mut self, seq_num: usize, ack_num: usize) -> Result<(), DmaError> {
             self.dma_enabled = true;
+            tcp_trace!("DMA enabled for TestFpgaSynchronizer with seq={}, ack={}", seq_num, ack_num);
             Ok(())
         }
         
