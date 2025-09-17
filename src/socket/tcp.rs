@@ -168,55 +168,6 @@ impl InjectedSegmentSynchronizer for NoFpgaSynchronizer {
     }
 }
 
-/// A mock synchronizer that simulates FPGA behavior
-#[derive(Debug)]
-pub struct MockSynchronizer {
-    injection_str: Vec<u8>,
-    dma_enabled: bool,
-}
-
-impl MockSynchronizer {
-    pub fn new(inj_str: &str) -> Self {
-        Self {
-            injection_str: inj_str.into(),
-            dma_enabled: false,
-        }
-    }
-}
-
-impl InjectedSegmentSynchronizer for MockSynchronizer {
-    fn send_data_via_dma(&mut self, _payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
-        if !self.dma_enabled {
-            return Err(DmaError::Illegal);
-        }
-        // For proof-of-concept: simulate FPGA behavior
-        // In real implementation, would send payload.len() to FPGA
-        Ok(Some(self.injection_str.clone()))
-    }
-
-    fn is_dma_enabled(&self) -> bool {
-        self.dma_enabled
-    }
-
-    fn set_dma_enabled(
-        &mut self,
-        seq_num: TcpSeqNumber,
-        ack_num: TcpSeqNumber,
-    ) -> Result<(), DmaError> {
-        self.dma_enabled = true;
-        tcp_trace!(
-            "DMA enabled for MockSynchronizer with seq={}, ack={}",
-            seq_num,
-            ack_num
-        );
-        Ok(())
-    }
-
-    fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError> {
-        self.dma_enabled = false;
-        Ok(Vec::new()) // Mock doesn't have pending data
-    }
-}
 
 /// A length-based mock synchronizer for proof-of-concept
 #[derive(Debug)]
@@ -306,7 +257,6 @@ impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
 #[derive(Debug)]
 pub enum AnyInjectedSegmentSynchronizer {
     NoFpga(NoFpgaSynchronizer),
-    Mock(MockSynchronizer),
     LengthMock(LengthMockSynchronizer),
     #[cfg(test)]
     Test(test::TestFpgaSynchronizer),
@@ -316,7 +266,6 @@ impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
     fn send_data_via_dma(&mut self, payload: &[u8]) -> Result<Option<Vec<u8>>, DmaError> {
         match self {
             Self::NoFpga(sync) => sync.send_data_via_dma(payload),
-            Self::Mock(sync) => sync.send_data_via_dma(payload),
             Self::LengthMock(sync) => sync.send_data_via_dma(payload),
             #[cfg(test)]
             Self::Test(sync) => sync.send_data_via_dma(payload),
@@ -326,7 +275,6 @@ impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
     fn is_dma_enabled(&self) -> bool {
         match self {
             Self::NoFpga(sync) => sync.is_dma_enabled(),
-            Self::Mock(sync) => sync.is_dma_enabled(),
             Self::LengthMock(sync) => sync.is_dma_enabled(),
             #[cfg(test)]
             Self::Test(sync) => sync.is_dma_enabled(),
@@ -340,7 +288,6 @@ impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
     ) -> Result<(), DmaError> {
         match self {
             Self::NoFpga(sync) => sync.set_dma_enabled(seq_num, ack_num),
-            Self::Mock(sync) => sync.set_dma_enabled(seq_num, ack_num),
             Self::LengthMock(sync) => sync.set_dma_enabled(seq_num, ack_num),
             #[cfg(test)]
             Self::Test(sync) => sync.set_dma_enabled(seq_num, ack_num),
@@ -350,7 +297,6 @@ impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
     fn set_dma_disabled(&mut self) -> Result<Vec<u8>, DmaError> {
         match self {
             Self::NoFpga(sync) => sync.set_dma_disabled(),
-            Self::Mock(sync) => sync.set_dma_disabled(),
             Self::LengthMock(sync) => sync.set_dma_disabled(),
             #[cfg(test)]
             Self::Test(sync) => sync.set_dma_disabled(),
@@ -8567,11 +8513,20 @@ mod test {
 
         let buf = SocketBuffer::new(vec![b'.'; 7]);
         s.tx_buffer = MaskedSocketBuffer::new(buf);
-        let synchronizer = MockSynchronizer::new("*");
-        s.set_synchronizer(AnyInjectedSegmentSynchronizer::Mock(synchronizer));
+        let synchronizer = TestFpgaSynchronizer::new();
+        s.set_synchronizer(AnyInjectedSegmentSynchronizer::Test(synchronizer));
         s.enable_dma(LOCAL_SEQ + 1, REMOTE_SEQ + 1).unwrap();
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"*".to_vec());
+        }
         assert_eq!(s.send_slice(b"a"), Ok(1));
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"*".to_vec());
+        }
         assert_eq!(s.send_slice(b"b"), Ok(1));
+        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
+            sync.queue_autonomous_data(b"*".to_vec());
+        }
         assert_eq!(s.send_slice(b"c"), Ok(1));
         assert_eq!(s.tx_buffer.get_allocated(0, 7), b"*a*b*c");
     }
@@ -8583,8 +8538,6 @@ mod test {
 
         let buf = SocketBuffer::new(vec![b'.'; 14]);
         s.tx_buffer = MaskedSocketBuffer::new(buf);
-        let sync_str = "***";
-        let sync_str_len = sync_str.len();
         let synchronizer = TestFpgaSynchronizer::new();
         s.set_synchronizer(AnyInjectedSegmentSynchronizer::Test(synchronizer));
         s.enable_dma(LOCAL_SEQ + 1, REMOTE_SEQ + 1).unwrap();
@@ -8593,29 +8546,13 @@ mod test {
         }
         let payload = b"aaaa";
         assert_eq!(s.send_slice(payload), Ok(payload.len()));
-        recv_fpga!(
-            s,
-            payload.to_vec() // Ok(TcpRepr {
-                             //     seq_number: seq_num,
-                             //     ack_number: Some(REMOTE_SEQ + 1),
-                             //     payload: &payload[..],
-                             //     ..RECV_TEMPL
-                             // })
-        );
+        recv_fpga!(s, payload.to_vec());
         if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.socket.segment_synchronizer {
             sync.queue_autonomous_data(b"///".to_vec());
         }
         let payload = b"aaaa";
         assert_eq!(s.send_slice(payload), Ok(payload.len()));
-        recv_fpga!(
-            s,
-            payload.to_vec() // Ok(TcpRepr {
-                             //     seq_number: seq_num,
-                             //     ack_number: Some(REMOTE_SEQ + 1),
-                             //     payload: &b"bbb"[..],
-                             //     ..RECV_TEMPL
-                             // })
-        );
+        recv_fpga!(s, payload.to_vec());
     }
 
     #[test]
