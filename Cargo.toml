@@ -38,6 +38,7 @@ rstest = "0.17"
 insta = "1.41.1"
 rand_chacha = "0.3.1"
 idna = { version = "=1.0.1" }
+proptest = "1.4"
 
 [features]
 std = ["managed/std", "alloc"]

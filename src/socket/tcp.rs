@@ -131,11 +131,7 @@ pub trait InjectedSegmentSynchronizer {
 
     /// Enable DMA and notify FPGA it can send autonomous packets
     /// Takes sequence_number and ack_number to sync FPGA with current TCP state
-    fn enable_dma(
-        &mut self,
-        seq_num: TcpSeqNumber,
-        ack_num: TcpSeqNumber,
-    ) -> Result<(), DmaError>;
+    fn enable_dma(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError>;
 
     /// Disable DMA and retrieve any pending FPGA-sent data
     fn disable_dma(&mut self) -> Result<Vec<u8>, DmaError>;
@@ -219,11 +215,7 @@ impl InjectedSegmentSynchronizer for LengthMockSynchronizer {
         Ok(None)
     }
 
-    fn enable_dma(
-        &mut self,
-        seq_num: TcpSeqNumber,
-        ack_num: TcpSeqNumber,
-    ) -> Result<(), DmaError> {
+    fn enable_dma(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
         self.dma_enabled = true;
         tcp_trace!(
             "DMA enabled for LengthMockSynchronizer with seq={}, ack={}",
@@ -292,11 +284,7 @@ impl InjectedSegmentSynchronizer for AnyInjectedSegmentSynchronizer {
         }
     }
 
-    fn enable_dma(
-        &mut self,
-        seq_num: TcpSeqNumber,
-        ack_num: TcpSeqNumber,
-    ) -> Result<(), DmaError> {
+    fn enable_dma(&mut self, seq_num: TcpSeqNumber, ack_num: TcpSeqNumber) -> Result<(), DmaError> {
         match self {
             Self::NoFpga(sync) => sync.enable_dma(seq_num, ack_num),
             Self::LengthMock(sync) => sync.enable_dma(seq_num, ack_num),
@@ -3399,7 +3387,7 @@ mod test {
             }
         }
 
-        // Get all the packets that the host sent
+        // Get all the packets that the host sent via DMA
         pub fn get_host_generated_packets(&self) -> BTreeMap<TcpSeqNumber, Vec<u8>> {
             self.packets
                 .iter()
@@ -3429,7 +3417,8 @@ mod test {
                 .collect()
         }
 
-        // Get all the packets that the fpga sent autonomously
+        // Get all the packets that the fpga sent autonomously, that the host doesn't yet
+        // know about
         pub fn get_new_fpga_generated_packets(&self) -> BTreeMap<TcpSeqNumber, Vec<u8>> {
             self.get_fpga_generated_packets()
                 .into_iter()
@@ -4074,6 +4063,20 @@ mod test {
     /// Create an established socket with FPGA packet tracking enabled
     fn socket_established_with_fpga_tracking() -> TestSocket {
         let mut s = socket_with_fpga_tracking();
+        s.state = State::Established;
+        s.tuple = Some(TUPLE);
+        s.local_seq_no = LOCAL_SEQ + 1;
+        s.remote_seq_no = REMOTE_SEQ + 1;
+        s.remote_last_seq = LOCAL_SEQ + 1;
+        s.remote_last_ack = Some(REMOTE_SEQ + 1);
+        s.remote_last_win = s.scaled_window();
+        s.remote_win_len = 256;
+        s
+    }
+
+    /// Create an established socket with FPGA packet tracking and custom buffer sizes
+    fn socket_established_with_fpga_tracking_and_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
+        let mut s = socket_with_fpga_tracking_and_buffer_sizes(tx_len, rx_len);
         s.state = State::Established;
         s.tuple = Some(TUPLE);
         s.local_seq_no = LOCAL_SEQ + 1;
@@ -10237,5 +10240,94 @@ mod test {
                 panic!("Couldn't get seq num from FPGA");
             };
         assert_eq!(fpga_seq_num, s.socket.remote_last_seq);
+    }
+
+    // Property-based test using proptest
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn test_mixed_dma_ethernet_packet_sending(
+            packets in prop::collection::vec(
+                (prop::collection::vec(any::<u8>(), 1..=16), any::<bool>()), // (data, use_dma)
+                1..=8
+            )
+        ) {
+            let mut s = socket_established_with_fpga_tracking_and_buffer_sizes(1024, 1024);
+            s.set_nagle_enabled(false);
+
+            let mut expected_host_packets_sent_via_dma = Vec::new();
+            let mut expected_autonomous_fpga_packets = Vec::new();
+            let mut all_sent_data = Vec::new();
+
+            for (data, use_dma) in packets {
+                if use_dma {
+                    // Enable DMA if not already enabled
+                    if !s.is_dma_enabled() {
+                        s.enable_dma().unwrap();
+                    }
+
+                    // Sometimes add autonomous FPGA data before sending
+                    if data[0] % 3 == 0 {
+                        let fpga_data = vec![b'F'; (data[0] % 8 + 1) as usize];
+                        println!("QUEUEING AUTONOMOUS: {:?}", fpga_data);
+                        if let AnyInjectedSegmentSynchronizer::Test(ref mut sync) = s.segment_synchronizer {
+                            sync.queue_autonomous_data(fpga_data.clone());
+                            expected_autonomous_fpga_packets.push(fpga_data.clone());
+                            all_sent_data.extend_from_slice(&fpga_data);
+                        }
+                    }
+
+                    // Send host data via DMA
+                    let sent = s.send_slice(&data).unwrap();
+                    if sent > 0 {
+                        expected_host_packets_sent_via_dma.push(data[..sent].to_vec());
+                        all_sent_data.extend_from_slice(&data[..sent]);
+                    }
+                } else {
+                    // Disable DMA if enabled
+                    if s.is_dma_enabled() {
+                        let _pending = s.disable_dma().unwrap();
+                    }
+
+                    // Send via normal ethernet interface
+                    let sent = s.send_slice(&data).unwrap();
+                    if sent > 0 {
+                        all_sent_data.extend_from_slice(&data[..sent]);
+                    }
+                }
+            }
+
+            // Verify all expected packets were sent to FPGA
+            if let AnyInjectedSegmentSynchronizer::Test(ref sync) = s.segment_synchronizer {
+                let host_packets = sync.get_host_generated_packets();
+                let fpga_packets = sync.get_fpga_generated_packets();
+
+                println!("FPGA PACKETS: {:?}", fpga_packets);
+
+                prop_assert_eq!(host_packets.len(), expected_host_packets_sent_via_dma.len());
+                prop_assert_eq!(fpga_packets.len(), expected_autonomous_fpga_packets.len());
+
+                // Verify packet contents
+                for (i, expected) in expected_host_packets_sent_via_dma.iter().enumerate() {
+                    let actual_packets: Vec<_> = host_packets.values().collect();
+                    if i < actual_packets.len() {
+                        prop_assert_eq!(actual_packets[i], expected);
+                    }
+                }
+            }
+
+            // Property: All sent data should be recoverable from the socket
+            if !all_sent_data.is_empty() {
+                let mut recv_buf = vec![0u8; all_sent_data.len()];
+                let total_received = s.recv_slice(&mut recv_buf).unwrap_or(0);
+
+                // We should be able to receive at least some of the data we sent
+                prop_assert!(total_received <= all_sent_data.len());
+                if total_received > 0 {
+                    prop_assert_eq!(&recv_buf[..total_received], &all_sent_data[..total_received]);
+                }
+            }
+        }
     }
 }
