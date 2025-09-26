@@ -34,6 +34,9 @@ impl fmt::Display for DmaError {
 
 mod congestion;
 
+#[cfg(test)]
+pub mod tcp_injection;
+
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
 }
